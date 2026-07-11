@@ -1,0 +1,15 @@
+# environment
+venv/
+__pycache__/
+*.pyc
+
+# anything transcription/audio related (belt and suspenders - app never writes these)
+*.wav
+*.mp3
+*.flac
+transcripts/
+history/
+*.log
+
+# local-only overrides
+config.local.json
