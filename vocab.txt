@@ -1,0 +1,10 @@
+# FlowLocal custom vocabulary - one term per line, # for comments.
+# These are fed to Whisper as hotwords so it spells them correctly.
+Fastec
+FlowLocal
+Wispr Flow
+Ollama
+OpenClaw
+Hermes
+Alienware
+AWCC

@@ -8,3 +8,5 @@ pystray>=0.19.5
 Pillow
 nvidia-cublas-cu12
 nvidia-cudnn-cu12
+pywin32
+pywebview

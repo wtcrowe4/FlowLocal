@@ -3,6 +3,9 @@ venv/
 __pycache__/
 *.pyc
 
+# training data - personal voice recordings, never push
+dataset/
+
 # anything transcription/audio related (belt and suspenders - app never writes these)
 *.wav
 *.mp3

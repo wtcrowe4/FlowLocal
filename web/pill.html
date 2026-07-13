@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+@font-face { font-family:'IBM Plex Mono'; font-weight:500; src:url("fonts/ibmplexmono-500.woff2") format('woff2'); }
+* { margin:0; padding:0; box-sizing:border-box; }
+/* Opaque dark lozenge styled to read as glass (true see-through isn't possible
+   on this WebView2 stack without the crash-prone layered-alpha path). The host
+   window is clipped to a stadium by SetWindowRgn; border-radius here matches so
+   the CSS edge is anti-aliased inside that hard clip. */
+body { overflow:hidden; user-select:none; -webkit-user-select:none; cursor:default;
+  font-family:'IBM Plex Mono',Consolas,monospace;
+  height:100vh; border-radius:11px;
+  background:linear-gradient(180deg,#17242F 0%,#0C131A 55%,#080D13 100%);
+  box-shadow:inset 0 0 0 1px rgba(0,194,255,.28),
+             inset 0 1px 0 rgba(170,235,255,.16),
+             inset 0 -2px 6px rgba(0,0,0,.45); }
+#wrap { display:flex; align-items:center; gap:7px; height:100vh; padding:0 9px; }
+#dot { width:6px; height:6px; border-radius:50%; background:rgba(94,132,150,.7); flex:none; }
+#dot.rec { background:#FF4D5A; box-shadow:0 0 6px #FF4D5A; }
+#dot.proc { background:#F0B83A; box-shadow:0 0 6px #F0B83A; }
+#txt { font-size:9.5px; letter-spacing:.08em; color:#93BCCD; white-space:nowrap;
+  font-variant-numeric:tabular-nums; text-shadow:0 1px 3px rgba(0,0,0,.9), 0 0 6px rgba(0,0,0,.6); }
+#txt.rec { color:#00C2FF; } #txt.proc { color:#F0B83A; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <span id="dot"></span>
+  <canvas id="bars" width="100" height="16" style="display:block;width:100px;height:16px;flex:none"></canvas>
+  <span id="txt">FLOW·READY</span>
+</div>
+<script>
+let state = "idle", vol = 0.05, target = 0.05, recStart = 0;
+let lastMeta = "", lastMetaUntil = 0, procStart = 0;
+function $(id){ return document.getElementById(id); }
+
+function onState(s) {
+  const prev = state;
+  state = s;
+  $('dot').className = s === 'recording' ? 'rec' : s === 'processing' ? 'proc' : '';
+  $('txt').className = $('dot').className;
+  if (s === 'recording') recStart = performance.now();
+  if (s === 'processing') procStart = performance.now();
+}
+function onLevels(arr) {
+  if (!arr || !arr.length) return;
+  const avg = arr.reduce((a,b)=>a+b,0)/arr.length;
+  target = Math.min(1, Math.pow(avg*7, .6));
+  window._levels = arr;
+}
+function onTranscript(text) {
+  const words = text.split(/\s+/).length;
+  const secs = ((performance.now() - procStart) / 1000).toFixed(1);
+  lastMeta = `✓ ${words}W · ${secs}S`;
+  lastMetaUntil = performance.now() + 6000;
+}
+
+(function loop(now) {
+  requestAnimationFrame(loop);
+  const bc = $('bars'), ctx = bc.getContext('2d');
+  const W = bc.width, H = bc.height, n = 14, bw = 2.5, gap = (W-n*bw)/(n-1);
+  const t = now/1000;
+  ctx.clearRect(0,0,W,H);
+  vol += (target-vol)*0.2;
+  for (let i=0;i<n;i++){
+    let h;
+    if (state==='recording' && window._levels){
+      const lv = window._levels;
+      const v = lv[Math.max(0, lv.length-n+i)]||0;
+      h = Math.max(1.5, Math.min(1, Math.pow(v*7,.6))*H);
+    } else if (state==='processing'){
+      h = 2 + 4*(1+Math.sin(t*4-i*.55))/2;
+    } else {
+      h = 1.5 + Math.abs(Math.sin(t*.8+i*.5))*1.2;
+    }
+    const bright = h/H;
+    ctx.fillStyle = state==='processing'
+      ? 'rgba(240,184,58,'+(0.35+bright*.65).toFixed(2)+')'
+      : state==='recording'
+        ? (bright>.7 ? '#BFF0FF' : 'rgba(0,194,255,'+(0.35+bright*.65).toFixed(2)+')')
+        : 'rgba(94,132,150,.5)';
+    ctx.fillRect(i*(bw+gap), (H-h)/2, bw, h);
+  }
+  // one-line status text
+  const txt = $('txt');
+  if (state === 'recording') {
+    const db = (-52 + vol*34).toFixed(0);
+    const el = (performance.now()-recStart)/1000;
+    txt.textContent = `REC ${db}dB ${Math.floor(el/60)}:${String(Math.floor(el%60)).padStart(2,'0')}`;
+  } else if (state === 'processing') {
+    const el = ((performance.now()-procStart)/1000).toFixed(1);
+    txt.textContent = `WHISPER ${el}S`;
+  } else {
+    txt.textContent = (performance.now() < lastMetaUntil) ? lastMeta : 'FLOW·READY';
+  }
+})(0);
+
+// click = toggle recording, drag = move (position saved on release)
+const body = document.body;
+body.addEventListener('pointerdown', e => {
+  body.setPointerCapture(e.pointerId);
+  const dpr = window.devicePixelRatio || 1;
+  let lx = e.screenX, ly = e.screenY, moved = false;
+  const mv = ev => {
+    const dx = Math.round((ev.screenX - lx) * dpr), dy = Math.round((ev.screenY - ly) * dpr);
+    if (dx || dy) {
+      if (Math.abs(ev.screenX - lx) > 2 || Math.abs(ev.screenY - ly) > 2) moved = true;
+      window.pywebview.api.move_by('pill', dx, dy);
+      lx = ev.screenX; ly = ev.screenY;
+    }
+  };
+  const up = () => {
+    try { body.releasePointerCapture(e.pointerId); } catch {}
+    body.removeEventListener('pointermove', mv); body.removeEventListener('pointerup', up);
+    if (moved) window.pywebview.api.save_pill_pos();
+    else window.pywebview.api.toggle();
+  };
+  body.addEventListener('pointermove', mv);
+  body.addEventListener('pointerup', up);
+});
+</script>
+</body>
+</html>

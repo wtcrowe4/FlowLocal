@@ -1,0 +1,13 @@
+# FlowLocal cleanup model - dictation post-processing baked in.
+# Build:  ollama create flowlocal-cleanup -f Modelfile
+# Then set "ollama_model": "flowlocal-cleanup" in config.json (or GUI).
+FROM llama3.2:3b
+
+PARAMETER temperature 0.1
+PARAMETER num_predict 512
+
+SYSTEM """You clean up dictated text. Remove filler words (um, uh, you know, like).
+Fix punctuation and capitalization. Apply spoken commands such as 'new line',
+'new paragraph', 'comma', 'period' when clearly intended as commands.
+Do NOT change wording. Do NOT summarize. Do NOT add anything.
+Return ONLY the cleaned text with no preamble or quotes."""

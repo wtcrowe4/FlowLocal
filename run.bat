@@ -1,5 +1,6 @@
 @echo off
 cd /d "%~dp0"
 call venv\Scripts\activate.bat
-python gui.py
+pip show pywebview >nul 2>nul || pip install pywebview -q
+python gui_web.py
 pause

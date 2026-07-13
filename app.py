@@ -23,11 +23,17 @@ def _register_nvidia_dlls():
         return
     try:
         import site
+        found = []
         for sp in site.getsitepackages():
             nvidia = Path(sp) / "nvidia"
             if nvidia.is_dir():
                 for bin_dir in nvidia.glob("*/bin"):
+                    found.append(str(bin_dir))
+                    # add_dll_directory alone is NOT enough: ctranslate2 loads
+                    # cublas/cudnn with plain LoadLibrary, which only searches PATH.
                     os.add_dll_directory(str(bin_dir))
+        if found:
+            os.environ["PATH"] = os.pathsep.join(found) + os.pathsep + os.environ.get("PATH", "")
     except Exception:
         pass
 
@@ -47,6 +53,23 @@ CONFIG_PATH = Path(__file__).parent / "config.json"
 CFG = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
 
 SAMPLE_RATE = CFG["sample_rate"]
+
+# ---------------------------------------------------------------- logging
+# print() CRASHES under pythonw (no stdout) - always use log() instead.
+LOG_PATH = Path(__file__).parent / "flowlocal.log"
+
+
+def log(msg):
+    line = f"{time.strftime('%H:%M:%S')} {msg}"
+    try:
+        print(line, flush=True)
+    except Exception:
+        pass
+    try:
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
 
 # ---------------------------------------------------------------- state
 class State:
@@ -96,10 +119,13 @@ class Recorder:
         self._stream = None
         self._lock = threading.Lock()
         self._started_at = 0.0
+        import collections
+        self.levels = collections.deque(maxlen=64)  # live RMS for GUI waveform
 
     def _callback(self, indata, frames, t, status):
         with self._lock:
             self._chunks.append(indata.copy())
+        self.levels.append(float(np.sqrt((indata ** 2).mean())))
 
     def start(self):
         with self._lock:
@@ -132,7 +158,7 @@ recorder = Recorder()
 model = None
 
 
-def load_model(log=print):
+def load_model(log=log):
     """Load Whisper. Call once at startup (GUI calls this in a thread)."""
     global model
     if model is not None:
@@ -150,13 +176,46 @@ def load_model(log=print):
     log(f"Model '{CFG['whisper_model']}' loaded on CPU (int8).")
 
 
+def warmup(log=log):
+    """Dummy transcription so the first real dictation isn't slow (CUDA kernel warmup)."""
+    try:
+        t0 = time.time()
+        list(model.transcribe(np.zeros(SAMPLE_RATE, dtype=np.float32), beam_size=1)[0])
+        log(f"warmup done in {time.time()-t0:.1f}s")
+    except Exception as e:
+        log(f"warmup failed: {e}")
+
+
+# ---------------------------------------------------------------- vocabulary
+VOCAB_PATH = Path(__file__).parent / "vocab.txt"
+_vocab_cache = {"mtime": 0.0, "words": []}
+
+
+def get_vocab():
+    """Custom terms from vocab.txt, reloaded automatically when the file changes."""
+    try:
+        m = VOCAB_PATH.stat().st_mtime
+        if m != _vocab_cache["mtime"]:
+            words = [w.strip() for w in VOCAB_PATH.read_text(encoding="utf-8").splitlines()
+                     if w.strip() and not w.strip().startswith("#")]
+            _vocab_cache.update(mtime=m, words=words)
+            log(f"vocab loaded: {len(words)} terms")
+    except FileNotFoundError:
+        _vocab_cache["words"] = []
+    return _vocab_cache["words"]
+
+
 def transcribe(audio: np.ndarray) -> str:
+    vocab = get_vocab()
     segments, _info = model.transcribe(
         audio,
         language=CFG["language"] or None,
-        beam_size=5,
+        beam_size=CFG.get("beam_size", 2),
         vad_filter=True,
-        vad_parameters={"min_silence_duration_ms": 400},
+        # pad around detected speech so quiet word starts/ends aren't clipped
+        vad_parameters={"min_silence_duration_ms": 500, "speech_pad_ms": 400,
+                        "threshold": 0.35},
+        hotwords=" ".join(vocab) if vocab else None,
     )
     return " ".join(s.text.strip() for s in segments).strip()
 
@@ -174,15 +233,16 @@ CLEANUP_PROMPT = (
 def cleanup(text: str) -> str:
     if not CFG["cleanup_enabled"] or not text:
         return text
+    # custom Modelfile builds (flowlocal-*) have the system prompt baked in
+    msgs = ([] if CFG["ollama_model"].startswith("flowlocal")
+            else [{"role": "system", "content": CLEANUP_PROMPT}])
+    msgs.append({"role": "user", "content": text})
     try:
         r = requests.post(
             f"{CFG['ollama_url']}/api/chat",
             json={
                 "model": CFG["ollama_model"],
-                "messages": [
-                    {"role": "system", "content": CLEANUP_PROMPT},
-                    {"role": "user", "content": text},
-                ],
+                "messages": msgs,
                 "stream": False,
                 "options": {"temperature": 0.1},
             },
@@ -194,8 +254,91 @@ def cleanup(text: str) -> str:
         if cleaned and 0.3 < len(cleaned) / max(len(text), 1) < 3.0:
             return cleaned
     except Exception as e:
-        print(f"Ollama cleanup skipped: {e}")
+        log(f"Ollama cleanup skipped: {e}")
     return text
+
+
+# ---------------------------------------------------------------- integrations
+def append_to_vault(text: str):
+    """Opt-in: append transcript to Obsidian vault so personal-rag indexes it."""
+    if not CFG.get("vault_append_enabled") or not text:
+        return
+    try:
+        p = Path(CFG["vault_append_path"])
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with open(p, "a", encoding="utf-8") as f:
+            f.write(f"- **{time.strftime('%Y-%m-%d %H:%M')}** {text}\n")
+        log("vault: appended")
+    except Exception as e:
+        log(f"vault append failed: {e}")
+
+
+def save_training_pair(audio: np.ndarray, raw_text: str):
+    """Opt-in: save wav + raw transcript pairs to dataset/ for future fine-tuning."""
+    if not CFG.get("save_training_data") or not raw_text:
+        return
+    try:
+        import wave
+        ddir = Path(__file__).parent / "dataset"
+        ddir.mkdir(exist_ok=True)
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        with wave.open(str(ddir / f"{ts}.wav"), "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(SAMPLE_RATE)
+            w.writeframes((np.clip(audio, -1, 1) * 32767).astype(np.int16).tobytes())
+        (ddir / f"{ts}.txt").write_text(raw_text, encoding="utf-8")
+        log(f"dataset: saved pair {ts}")
+    except Exception as e:
+        log(f"dataset save failed: {e}")
+
+
+# ---------------------------------------------------------------- ask mode (personal-rag)
+def rag_query(q: str):
+    """POST the raw question to personal-rag. Tries localhost, then tailnet IPs."""
+    for base in CFG.get("rag_urls", []):
+        try:
+            r = requests.post(base.rstrip("/") + "/query",
+                              json={"query": q, "k": CFG.get("rag_k", 5)}, timeout=6)
+            r.raise_for_status()
+            return r.json().get("results", [])
+        except Exception as e:
+            log(f"rag: {base} failed: {e}")
+    return None
+
+
+def ask_rag(q: str) -> str:
+    """Dictated question -> personal-rag chunks -> local LLM answer."""
+    results = rag_query(q)
+    if results is None:
+        return "[FlowLocal] personal-rag unreachable - is `uv run rag serve` running?"
+    chunks = [c for c in results if c.get("score", 0) >= 0.4]
+    if not chunks:
+        return "[FlowLocal] no relevant notes found."
+    context = "\n\n".join(
+        f"[{c.get('file_path', '?')} > {c.get('heading_path', '')}]\n{c.get('content', '')[:1200]}"
+        for c in chunks[:5])
+    try:
+        r = requests.post(
+            f"{CFG['ollama_url']}/api/chat",
+            json={
+                "model": CFG.get("ask_model", CFG["ollama_model"]),
+                "messages": [
+                    {"role": "system",
+                     "content": "Answer the question using ONLY the provided notes. "
+                                "Be concise. If the notes don't contain the answer, say so."},
+                    {"role": "user", "content": f"NOTES:\n{context}\n\nQUESTION: {q}"},
+                ],
+                "stream": False,
+                "options": {"temperature": 0.2},
+            },
+            timeout=CFG.get("ask_timeout_sec", 30),
+        )
+        r.raise_for_status()
+        return r.json()["message"]["content"].strip()
+    except Exception as e:
+        log(f"ask: answer generation failed: {e}")
+        return "[FlowLocal] answer generation failed - see flowlocal.log."
 
 
 # ---------------------------------------------------------------- inject
@@ -232,15 +375,21 @@ def beep(kind: str):
 
 
 # ---------------------------------------------------------------- pipeline
-def start_recording():
+_rec_mode = "dictate"  # or "ask"
+
+
+def start_recording(mode="dictate"):
+    global _rec_mode
     if get_state() != State.IDLE:
         return
+    _rec_mode = mode
     set_state(State.RECORDING)
     beep("start")
     try:
         recorder.start()
+        log("recording started")
     except Exception as e:
-        print(f"Mic error: {e}")
+        log(f"Mic error: {e}")
         beep("error")
         set_state(State.IDLE)
 
@@ -250,22 +399,38 @@ def stop_and_process():
         return
     set_state(State.PROCESSING)
     beep("stop")
-    audio, duration = recorder.stop()
 
     def _work():
         try:
+            # tail capture: user releases the key while still finishing the last
+            # word - keep the mic open a beat so it isn't clipped
+            time.sleep(0.35)
+            audio, duration = recorder.stop()
+            log(f"pipeline: {duration:.1f}s audio, {audio.size} samples")
             if duration < CFG["min_recording_sec"] or audio.size == 0:
+                log("pipeline: too short, skipped")
                 return
             t0 = time.time()
-            text = transcribe(audio)
-            print(f"[whisper {time.time()-t0:.1f}s] {text}")
-            if not text:
+            raw_text = transcribe(audio)
+            log(f"pipeline: whisper done in {time.time()-t0:.1f}s -> {raw_text!r}")
+            if not raw_text:
                 return
-            text = cleanup(text)
+            if _rec_mode == "ask":
+                answer = ask_rag(raw_text)
+                inject_text(answer)
+                _emit("transcript", f"Q: {raw_text}\nA: {answer}")
+                log("pipeline: ask answered")
+                return
+            save_training_pair(audio, raw_text)
+            t1 = time.time()
+            text = cleanup(raw_text)
+            log(f"pipeline: cleanup done in {time.time()-t1:.1f}s -> {text!r}")
             inject_text(text)
+            log("pipeline: injected")
             _emit("transcript", text)
+            append_to_vault(text)
         except Exception as e:
-            print(f"Pipeline error: {e}")
+            log(f"Pipeline ERROR: {type(e).__name__}: {e}")
             beep("error")
         finally:
             set_state(State.IDLE)
@@ -278,6 +443,10 @@ _hold_down = False
 
 
 def _on_hold_press(_e):
+    """Right Ctrl = pure hold-to-talk dictation. Ask mode is NOT overloaded onto
+    this key - a double-tap used to flip into ask mode and was firing by accident
+    during normal dictation (speech got answered instead of transcribed). Ask now
+    lives on its own hotkey (`ask_hotkey`, default ctrl+alt+space)."""
     global _hold_down
     if _hold_down:  # key auto-repeat
         return
@@ -288,7 +457,7 @@ def _on_hold_press(_e):
 def _on_hold_release(_e):
     global _hold_down
     _hold_down = False
-    stop_and_process()
+    stop_and_process()  # too-short recordings are dropped by min_recording_sec
 
 
 def _on_toggle():
@@ -296,6 +465,14 @@ def _on_toggle():
         stop_and_process()
     else:
         start_recording()
+
+
+def _on_ask_toggle():
+    """Press once, ask your question out loud, press again -> answer typed at cursor."""
+    if get_state() == State.RECORDING:
+        stop_and_process()
+    else:
+        start_recording("ask")
 
 
 def setup_hotkeys():
@@ -313,11 +490,15 @@ def setup_hotkeys():
                 _on_hold_release(e)
 
         keyboard.hook(_hold_hook)
-        print(f"Hold-to-talk: {hold}")
+        log(f"Hold-to-talk: {hold}")
     tog = CFG["toggle_hotkey"]
     if tog:
         keyboard.add_hotkey(tog, _on_toggle)
-        print(f"Toggle: {tog}")
+        log(f"Toggle: {tog}")
+    ask = CFG.get("ask_hotkey")
+    if ask:
+        keyboard.add_hotkey(ask, _on_ask_toggle)
+        log(f"Ask (personal-rag): {ask}")
 
 
 # ---------------------------------------------------------------- tray
@@ -359,8 +540,9 @@ def run_tray():
 # ---------------------------------------------------------------- main
 def main():
     load_model()
+    warmup()
     setup_hotkeys()
-    print("FlowLocal ready. Dictate into any app. Ctrl+C or tray > Quit to exit.")
+    log("FlowLocal ready. Dictate into any app. Ctrl+C or tray > Quit to exit.")
     run_tray()
 
 

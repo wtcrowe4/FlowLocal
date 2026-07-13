@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>FlowLocal</title>
+<style>
+@font-face { font-family:'IBM Plex Mono'; font-weight:400; src:url("fonts/ibmplexmono-400.woff2") format('woff2'); }
+@font-face { font-family:'IBM Plex Mono'; font-weight:500; src:url("fonts/ibmplexmono-500.woff2") format('woff2'); }
+@font-face { font-family:'IBM Plex Mono'; font-weight:600; src:url("fonts/ibmplexmono-600.woff2") format('woff2'); }
+
+* { margin:0; padding:0; box-sizing:border-box; }
+html, body { background:transparent; }
+body {
+  min-height:100vh; overflow:hidden;
+  font-family:'IBM Plex Mono',Consolas,monospace; color:#D8F1FB;
+  display:flex; flex-direction:column; align-items:center;
+  user-select:none; -webkit-user-select:none;
+}
+@keyframes dvDrift1{0%,100%{transform:translate(0,0) scale(1)}50%{transform:translate(36px,-24px) scale(1.18)}}
+@keyframes dvDrift2{0%,100%{transform:translate(0,0) scale(1)}50%{transform:translate(-30px,28px) scale(1.12)}}
+@keyframes dvPulse{0%,100%{opacity:1}50%{opacity:.45}}
+
+/* frame fills the entire window - nothing exists outside it */
+.window {
+  position:relative; width:calc(100vw - 4px); height:calc(100vh - 4px); margin:2px;
+  display:flex; flex-direction:column;
+  background:rgba(6,12,16,.28); border:1px solid rgba(0,194,255,.32);
+  box-shadow:inset 0 1px 0 rgba(160,232,255,.12);
+  overflow:hidden;
+}
+/* glow drift + scanlines live INSIDE the frame now */
+.window::before { content:''; position:absolute; top:-160px; left:-120px; width:520px; height:520px;
+  border-radius:50%; background:radial-gradient(circle, rgba(0,194,255,.1), transparent 65%);
+  filter:blur(14px); animation:dvDrift1 16s ease-in-out infinite; pointer-events:none; }
+.window::after { content:''; position:absolute; inset:0; pointer-events:none;
+  background:repeating-linear-gradient(0deg, rgba(0,194,255,.02) 0 1px, transparent 1px 4px); }
+.bk { position:absolute; width:12px; height:12px; }
+.bk.tl { top:-1px; left:-1px; border-top:2px solid #00C2FF; border-left:2px solid #00C2FF; }
+.bk.tr { top:-1px; right:-1px; border-top:2px solid #00C2FF; border-right:2px solid #00C2FF; }
+.bk.bl { bottom:-1px; left:-1px; border-bottom:2px solid #00C2FF; border-left:2px solid #00C2FF; }
+.bk.br { bottom:-1px; right:-1px; border-bottom:2px solid #00C2FF; border-right:2px solid #00C2FF; }
+.pill .bk { width:9px; height:9px; }
+
+.titlebar { display:flex; align-items:center; justify-content:space-between;
+  padding:10px 16px; border-bottom:1px dashed rgba(0,194,255,.22); }
+.titlebar .tag { font-size:11px; color:#5E8496; letter-spacing:.18em; }
+.winbtns { display:flex; gap:16px; color:#5E8496; font-size:12px; }
+.winbtns span { cursor:pointer; } .winbtns span:hover { color:#00C2FF; }
+
+.header { display:flex; align-items:center; justify-content:space-between; padding:18px 20px 14px; }
+.brand { font-size:22px; font-weight:600; letter-spacing:.14em; color:#00C2FF;
+  text-shadow:0 0 18px rgba(0,194,255,.55); }
+.sub { font-size:9px; letter-spacing:.3em; color:#5E8496; margin-top:3px; }
+.sys { display:flex; align-items:center; gap:7px; font-size:10px; letter-spacing:.16em; color:#93BCCD; justify-content:flex-end; }
+.sysdot { width:7px; height:7px; border-radius:50%; background:#5E8496; }
+.sysdot.ready { background:#00C2FF; box-shadow:0 0 8px #00C2FF; animation:dvPulse 2.2s ease-in-out infinite; }
+.sysdot.rec { background:#FF4D5A; box-shadow:0 0 8px #FF4D5A; }
+.sysdot.proc { background:#F0B83A; box-shadow:0 0 8px #F0B83A; }
+
+#startBtn { margin-top:7px; padding:8px 18px; border:1px solid #00C2FF; color:#00C2FF;
+  font-size:11px; letter-spacing:.2em; cursor:pointer; font-family:inherit;
+  background:linear-gradient(180deg,rgba(0,194,255,.12),rgba(0,194,255,.03));
+  box-shadow:inset 0 0 14px rgba(0,194,255,.12), 0 0 12px rgba(0,194,255,.1); }
+#startBtn:hover { background:linear-gradient(180deg,rgba(0,194,255,.3),rgba(0,194,255,.1));
+  box-shadow:inset 0 0 18px rgba(0,194,255,.25), 0 0 20px rgba(0,194,255,.3); }
+#startBtn.rec { border-color:#FF4D5A; color:#FF4D5A;
+  background:linear-gradient(180deg,rgba(255,77,90,.15),rgba(255,77,90,.03));
+  box-shadow:inset 0 0 14px rgba(255,77,90,.15), 0 0 12px rgba(255,77,90,.15); }
+#startBtn:disabled { opacity:.4; cursor:default; }
+
+.hints { display:flex; gap:16px; padding:0 20px 14px; font-size:9.5px; color:#5E8496; letter-spacing:.1em; }
+
+.seclabel { font-size:9.5px; letter-spacing:.22em; color:#5E8496; margin-bottom:8px; }
+.transcript-sec { flex:1; display:flex; flex-direction:column; min-height:0; padding:0 20px; }
+.log { display:flex; flex-direction:column; gap:7px; flex:1; min-height:60px; overflow-y:auto; }
+.log::-webkit-scrollbar { width:6px; } .log::-webkit-scrollbar-thumb { background:rgba(0,194,255,.25); }
+.entry { padding:10px 13px; border:1px solid rgba(0,194,255,.18); background:rgba(0,194,255,.03);
+  font-size:12px; line-height:1.55; user-select:text; -webkit-user-select:text; white-space:pre-wrap; }
+.entry .meta { margin-top:5px; font-size:9px; color:#5E8496; letter-spacing:.1em; }
+.empty { padding:16px 13px; font-size:11px; color:#5E8496; border:1px dashed rgba(0,194,255,.15); }
+
+.chip { padding:7px 14px; border:1px solid rgba(0,194,255,.35); font-size:10px;
+  letter-spacing:.14em; color:#00C2FF; cursor:pointer; background:none; font-family:inherit; }
+.chip:hover { background:rgba(0,194,255,.12); }
+.chip.dim { border-color:rgba(0,194,255,.15); color:#5E8496; }
+.chip.dim:hover { background:rgba(0,194,255,.06); }
+
+.cfg { border:1px solid rgba(0,194,255,.18); background:rgba(0,194,255,.02); }
+.cfgrow { display:flex; align-items:center; justify-content:space-between;
+  padding:9px 13px; border-bottom:1px dashed rgba(0,194,255,.17); font-size:11px; }
+.cfgrow:last-child { border-bottom:none; }
+.cfgrow .k { color:#93BCCD; }
+.cfgrow select, .cfgrow input[type=text] {
+  background:rgba(4,8,11,.7); color:#00C2FF; border:1px solid rgba(0,194,255,.25);
+  font-family:inherit; font-size:11px; padding:3px 6px; outline:none; text-align:right; }
+.cfgrow input[type=text] { width:170px; }
+.cfgrow select:focus, .cfgrow input:focus { border-color:#00C2FF; }
+.tog { color:#00C2FF; letter-spacing:.1em; cursor:pointer; }
+.tog.off { color:#5E8496; }
+
+#saveBtn { padding:7px 20px; background:linear-gradient(180deg,#4FDCFF,#00A9E8); color:#04080B;
+  font-size:10px; font-weight:600; letter-spacing:.2em; border:none; cursor:pointer; font-family:inherit;
+  box-shadow:0 0 16px rgba(0,194,255,.35), inset 0 1px 0 rgba(255,255,255,.4); }
+#saveBtn:hover { box-shadow:0 0 26px rgba(0,194,255,.6), inset 0 1px 0 rgba(255,255,255,.5); }
+
+.footer { padding:8px 20px; border-top:1px dashed rgba(0,194,255,.2); font-size:9px;
+  color:#5E8496; letter-spacing:.12em; min-height:26px; }
+
+.pillzone { position:relative; flex:1; min-height:100px; display:flex; align-items:center; justify-content:center; }
+.pill { position:relative; display:none; align-items:center; gap:12px; padding:11px 20px;
+  background:rgba(5,10,13,.28); border:1px solid rgba(0,194,255,.42); backdrop-filter:blur(10px);
+  box-shadow:0 14px 40px rgba(0,0,0,.6), 0 0 26px rgba(0,194,255,.14), inset 0 1px 0 rgba(160,232,255,.15);
+  will-change:transform; }
+.pill.show { display:flex; }
+#pillTag { font-size:9px; color:#00C2FF; letter-spacing:.2em; }
+#pillTag.proc { color:#F0B83A; }
+#pillMeta { font-size:9.5px; color:#93BCCD; letter-spacing:.1em; font-variant-numeric:tabular-nums;
+  min-width:82px; text-align:right; }
+
+.modal { position:fixed; inset:0; display:none; align-items:center; justify-content:center;
+  background:rgba(4,8,11,.75); z-index:50; }
+.modal.show { display:flex; }
+.modalbox { position:relative; width:420px; background:rgba(6,12,16,.9); border:1px solid rgba(0,194,255,.35);
+  backdrop-filter:blur(12px); padding:16px; box-shadow:0 24px 70px rgba(0,0,0,.6); }
+.modalbox textarea { width:100%; height:260px; margin:10px 0; background:rgba(4,8,11,.8);
+  color:#D8F1FB; border:1px solid rgba(0,194,255,.2); font-family:inherit; font-size:11.5px;
+  padding:8px; outline:none; resize:none; }
+.modalbox textarea:focus { border-color:#00C2FF; }
+</style>
+</head>
+<body>
+<div class="window">
+  <span class="bk tl"></span><span class="bk tr"></span><span class="bk bl"></span><span class="bk br"></span>
+
+  <div class="titlebar" style="cursor:move">
+    <span class="tag">FLOWLOCAL // v1.0</span>
+    <div class="winbtns"><span onclick="api('hide')">–</span><span onclick="api('hide')">✕</span></div>
+  </div>
+
+  <div class="header">
+    <div>
+      <div class="brand">FLOW·LOCAL</div>
+      <div class="sub">LOCAL VOICE TRANSCRIPTION UNIT</div>
+    </div>
+    <div style="display:flex;flex-direction:column;align-items:flex-end">
+      <div class="sys"><span class="sysdot" id="sysdot"></span><span id="systext">SYS.LOADING</span></div>
+      <button id="startBtn" disabled onclick="api('toggle')">◉ START</button>
+    </div>
+  </div>
+
+  <div class="hints" id="hints"></div>
+
+  <div class="transcript-sec">
+    <div class="seclabel">▸ TRANSCRIPT.LOG</div>
+    <div class="log" id="log"><div class="empty" id="logEmpty">AWAITING INPUT…</div></div>
+    <div style="display:flex;gap:8px;margin-top:9px">
+      <button class="chip" onclick="copyLast()">COPY.LAST</button>
+      <button class="chip dim" onclick="clearLog()">CLEAR</button>
+    </div>
+  </div>
+
+  <div style="padding:16px 20px">
+    <div class="seclabel">▸ CONFIG</div>
+    <div class="cfg">
+      <div class="cfgrow"><span class="k">WHISPER.MODEL</span><select id="cfgModel"></select></div>
+      <div class="cfgrow"><span class="k">HOLD.KEY</span><input type="text" id="cfgHold"></div>
+      <div class="cfgrow"><span class="k">TOGGLE.KEY</span><input type="text" id="cfgToggle"></div>
+      <div class="cfgrow"><span class="k">AI.CLEANUP</span><span class="tog" id="cfgCleanup" onclick="flip('cfgCleanup')">[ ON ]</span></div>
+      <div class="cfgrow"><span class="k">OLLAMA.MODEL</span><select id="cfgOllama"></select></div>
+      <div class="cfgrow"><span class="k">VAULT.LOG</span><span class="tog" id="cfgVault" onclick="flip('cfgVault')">[ OFF ]</span></div>
+      <div class="cfgrow"><span class="k">TRAIN.DATA</span><span class="tog" id="cfgTrain" onclick="flip('cfgTrain')">[ OFF ]</span></div>
+    </div>
+    <div style="display:flex;justify-content:space-between;margin-top:10px">
+      <button class="chip dim" onclick="openVocab()">VOCABULARY</button>
+      <button id="saveBtn" onclick="saveConfig()">SAVE ▸</button>
+    </div>
+  </div>
+
+  <div class="footer" id="footer"></div>
+</div>
+
+<div class="modal" id="vocabModal">
+  <div class="modalbox">
+    <span class="bk tl"></span><span class="bk tr"></span><span class="bk bl"></span><span class="bk br"></span>
+    <div class="seclabel">▸ CUSTOM.VOCABULARY — one term per line, applies next dictation</div>
+    <textarea id="vocabText" spellcheck="false"></textarea>
+    <div style="display:flex;justify-content:space-between">
+      <button class="chip dim" onclick="closeVocab()">CANCEL</button>
+      <button id="saveBtn" onclick="saveVocab()">SAVE ▸</button>
+    </div>
+  </div>
+</div>
+
+<script>
+// ---------------- state ----------------
+let CFG = {}, MODELS = [], lastText = "", state = "idle", ready = false;
+let vol = 0.05, target = 0.05, recStart = 0;
+
+function $(id) { return document.getElementById(id); }
+function api(m, ...a) { return window.pywebview.api[m](...a); }
+
+// ---------------- init ----------------
+window.addEventListener('pywebviewready', async () => {
+  const init = await api('init');
+  CFG = init.config; MODELS = init.models;
+  $('cfgModel').innerHTML = MODELS.map(m => `<option ${m===CFG.whisper_model?'selected':''}>${m}</option>`).join('');
+  if (!MODELS.includes(CFG.whisper_model)) $('cfgModel').innerHTML += `<option selected>${CFG.whisper_model}</option>`;
+  $('cfgHold').value = CFG.hold_hotkey; $('cfgToggle').value = CFG.toggle_hotkey;
+  // ollama dropdown: installed models from the daemon, current value always present
+  let om = init.ollama_models || [];
+  if (!om.includes(CFG.ollama_model)) om = [CFG.ollama_model, ...om];
+  $('cfgOllama').innerHTML = om.map(m => `<option ${m===CFG.ollama_model?'selected':''}>${m}</option>`).join('');
+  setTog('cfgCleanup', CFG.cleanup_enabled); setTog('cfgVault', CFG.vault_append_enabled);
+  setTog('cfgTrain', CFG.save_training_data);
+  $('vocabText').value = init.vocab;
+  $('hints').innerHTML =
+    `<span>[${CFG.hold_hotkey.toUpperCase()}] HOLD-TO-TALK</span>` +
+    `<span>[${CFG.toggle_hotkey.toUpperCase()}] TOGGLE</span>` +
+    (CFG.ask_hotkey ? `<span>[${CFG.ask_hotkey.toUpperCase()}] ASK.RAG</span>` : '');
+});
+
+// ---------------- engine events (called from python) ----------------
+function onReady() { ready = true; $('startBtn').disabled = false; onState('idle'); }
+function onLog(m) { $('footer').textContent = m; }
+function onState(s) {
+  state = s;
+  const dot = $('sysdot'), txt = $('systext'), btn = $('startBtn');
+  dot.className = 'sysdot'; btn.className = '';
+  if (s === 'recording') {
+    dot.classList.add('rec'); txt.textContent = 'SYS.LISTENING';
+    btn.classList.add('rec'); btn.textContent = '■ STOP';
+  } else if (s === 'processing') {
+    dot.classList.add('proc'); txt.textContent = 'SYS.PROCESSING';
+    btn.textContent = '· · ·';
+  } else {
+    dot.classList.add(ready ? 'ready' : ''); txt.textContent = ready ? 'SYS.READY' : 'SYS.LOADING';
+    btn.textContent = '◉ START';
+  }
+}
+function onTranscript(text) {
+  lastText = text;
+  const e = $('logEmpty'); if (e) e.remove();
+  const div = document.createElement('div');
+  div.className = 'entry';
+  const now = new Date();
+  const t = 'T-' + now.toTimeString().slice(0, 8);
+  const words = text.split(/\s+/).length;
+  div.innerHTML = `${text.replace(/&/g,'&amp;').replace(/</g,'&lt;')}<div class="meta">${t} · ${words}W</div>`;
+  $('log').prepend(div);
+}
+function onLevels(arr) {}  // pill window handles the waveform now
+
+// ---------------- window drag (pointer-capture + move deltas) ----------------
+const tb = document.querySelector('.titlebar');
+tb.addEventListener('pointerdown', e => {
+  if (e.target.closest('.winbtns')) return;
+  tb.setPointerCapture(e.pointerId);
+  const dpr = window.devicePixelRatio || 1;
+  let lx = e.screenX, ly = e.screenY;
+  const mv = ev => {
+    const dx = Math.round((ev.screenX - lx) * dpr), dy = Math.round((ev.screenY - ly) * dpr);
+    if (dx || dy) { window.pywebview.api.move_by('main', dx, dy); lx = ev.screenX; ly = ev.screenY; }
+  };
+  const up = () => {
+    try { tb.releasePointerCapture(e.pointerId); } catch {}
+    tb.removeEventListener('pointermove', mv); tb.removeEventListener('pointerup', up);
+  };
+  tb.addEventListener('pointermove', mv);
+  tb.addEventListener('pointerup', up);
+});
+
+// ---------------- controls ----------------
+function setTog(id, on) { const el = $(id); el.textContent = on ? '[ ON ]' : '[ OFF ]'; el.classList.toggle('off', !on); }
+function flip(id) {
+  const on = $(id).textContent.includes('ON');
+  setTog(id, !on);
+  if (id === 'cfgCleanup') api('set_flag', 'cleanup_enabled', !on);
+  if (id === 'cfgVault') api('set_flag', 'vault_append_enabled', !on);
+  if (id === 'cfgTrain') api('set_flag', 'save_training_data', !on);
+}
+async function saveConfig() {
+  const r = await api('save_config', {
+    whisper_model: $('cfgModel').value,
+    hold_hotkey: $('cfgHold').value.trim(),
+    toggle_hotkey: $('cfgToggle').value.trim(),
+    ollama_model: $('cfgOllama').value.trim(),
+    cleanup_enabled: $('cfgCleanup').textContent.includes('ON'),
+    vault_append_enabled: $('cfgVault').textContent.includes('ON'),
+    save_training_data: $('cfgTrain').textContent.includes('ON'),
+  });
+  onLog(r.restart ? 'SAVED · RESTART REQUIRED FOR MODEL/HOTKEYS' : 'CONFIG.SAVED');
+}
+function copyLast() { if (lastText) { api('copy_text', lastText); onLog('COPIED'); } }
+function clearLog() { $('log').innerHTML = '<div class="empty" id="logEmpty">AWAITING INPUT…</div>'; }
+function openVocab() { $('vocabModal').classList.add('show'); }
+function closeVocab() { $('vocabModal').classList.remove('show'); }
+async function saveVocab() { await api('save_vocab', $('vocabText').value); closeVocab(); onLog('VOCAB.SAVED'); }
+</script>
+</body>
+</html>
