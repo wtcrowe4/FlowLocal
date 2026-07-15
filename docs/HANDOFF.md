@@ -83,6 +83,14 @@ POST to personal-rag `/query` → top chunks → local LLM answers → answer pa
 
 ## Roadmap
 
+0. **TTS readback** (next up) — see `docs/PLAN-tts-readback.md`. Claude Code Stop
+   hook + kokoro-onnx daemon, native Windows. Solves Thomas's actual bottleneck
+   (slow reading of Claude responses). Notably does NOT require changing this
+   repo — FlowLocal is already the input half. herdr is an optional helper for
+   focus-gating and "agent blocked" cues, not a dependency. That plan also
+   documents corrections to the original Downloads plans (wrong kokoro package,
+   unnecessary WSL) and notes that **ask mode at `app.py:418` is already the
+   Plan 3 "core loop" minus a `speak()` call**.
 1. **pywebview UI port** — Thomas is designing in Claude; port design as HTML/CSS over existing engine events (`app.on_event("state"|"transcript")`).
 2. **whisper-lab** (separate repo/session) — Modal-based model eval + fine-tune. See `docs/whisper-lab-brief.md`.
 3. Vault ingest automation lives in personal-rag (cron `--changed-only`).

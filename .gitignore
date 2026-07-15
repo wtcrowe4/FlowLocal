@@ -16,3 +16,7 @@ history/
 
 # local-only overrides
 config.local.json
+
+# tooling caches
+.memsearch/
+.ruff_cache/
