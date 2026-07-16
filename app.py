@@ -341,6 +341,26 @@ def ask_rag(q: str) -> str:
         return "[FlowLocal] answer generation failed - see flowlocal.log."
 
 
+# ---------------------------------------------------------------- tts (tts-daemon)
+def tts_speak(text: str):
+    """Speak text via the shared tts-daemon (Kokoro, WSL localhost:8123).
+    Fire-and-forget: daemon down or disabled -> silent no-op."""
+    if not CFG.get("tts_enabled", True) or not text:
+        return
+
+    def _post():
+        try:
+            requests.post(
+                CFG.get("tts_url", "http://127.0.0.1:8123/speak"),
+                json={"text": text[:CFG.get("tts_max_chars", 1500)]},
+                timeout=CFG.get("tts_timeout_sec", 60),
+            )
+        except Exception as e:
+            log(f"tts: daemon unreachable, skipped: {e}")
+
+    threading.Thread(target=_post, daemon=True).start()
+
+
 # ---------------------------------------------------------------- inject
 def inject_text(text: str):
     if not text:
@@ -418,6 +438,7 @@ def stop_and_process():
             if _rec_mode == "ask":
                 answer = ask_rag(raw_text)
                 inject_text(answer)
+                tts_speak(answer)
                 _emit("transcript", f"Q: {raw_text}\nA: {answer}")
                 log("pipeline: ask answered")
                 return
