@@ -20,3 +20,6 @@ config.local.json
 # tooling caches
 .memsearch/
 .ruff_cache/
+
+# machine-specific settings (copy config.example.json -> config.json)
+config.json

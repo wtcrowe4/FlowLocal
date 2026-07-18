@@ -25,6 +25,8 @@ Hold hotkey → mic records → faster-whisper (GPU) transcribes → optional Ol
 
 ## Config (`config.json`)
 
+Copy `config.example.json` to `config.json` and adjust — `config.json` is machine-specific and untracked.
+
 | Key | Default | Notes |
 |---|---|---|
 | `hold_hotkey` | `right ctrl` | Hold-to-talk key ([key names](https://github.com/boppreh/keyboard)) |
