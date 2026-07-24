@@ -127,10 +127,7 @@ class Recorder:
             self._chunks.append(indata.copy())
         self.levels.append(float(np.sqrt((indata ** 2).mean())))
 
-    def start(self):
-        with self._lock:
-            self._chunks = []
-        self._started_at = time.time()
+    def _open(self):
         self._stream = sd.InputStream(
             samplerate=SAMPLE_RATE,
             channels=1,
@@ -138,6 +135,22 @@ class Recorder:
             callback=self._callback,
         )
         self._stream.start()
+
+    def start(self):
+        with self._lock:
+            self._chunks = []
+        self._started_at = time.time()
+        try:
+            self._open()
+        except Exception as e:
+            # PortAudio enumerates devices once at import. A default mic that was
+            # off at launch (e.g. wireless headset asleep) leaves a stale table and
+            # fails with "Error querying device -1" forever. Re-enumerate and retry
+            # so the mic recovers on the next keypress instead of needing a restart.
+            log(f"Mic open failed ({e}); re-enumerating PortAudio and retrying")
+            sd._terminate()
+            sd._initialize()
+            self._open()
 
     def stop(self):
         if self._stream:
