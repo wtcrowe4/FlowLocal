@@ -155,6 +155,13 @@ class Api:
     def toggle(self):
         app._on_toggle()
 
+    def set_recording_mode(self, mode):
+        if mode not in ("dictate", "ask"):
+            return {"mode": app.CFG.get("recording_mode", "dictate")}
+        app.CFG["recording_mode"] = mode
+        app.CONFIG_PATH.write_text(json.dumps(app.CFG, indent=2), encoding="utf-8")
+        return {"mode": mode}
+
     def move_by(self, which, dx, dy):
         """Drag: JS streams pointer deltas, we move the window. Native drag
         hand-off (WM_NCLBUTTONDOWN) doesn't work - WebView2 child owns the mouse."""

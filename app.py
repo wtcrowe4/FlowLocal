@@ -6,9 +6,11 @@ Hold hotkey (or toggle) -> speak -> release -> text typed into active window.
 
 import json
 import os
+import re
 import sys
 import threading
 import time
+from difflib import SequenceMatcher
 from pathlib import Path
 
 # Workarounds for flaky HuggingFace downloads on Windows (WinError 10054)
@@ -164,11 +166,21 @@ class Recorder:
             self._chunks = []
         return audio, time.time() - self._started_at
 
+    def snapshot(self, max_seconds: float) -> np.ndarray:
+        """Return a recent audio copy without interrupting active recording."""
+        with self._lock:
+            if not self._chunks:
+                return np.zeros(0, dtype=np.float32)
+            audio = np.concatenate(self._chunks).flatten()
+        max_samples = int(max_seconds * SAMPLE_RATE)
+        return audio[-max_samples:] if max_samples > 0 else audio
+
 
 recorder = Recorder()
 
 # ---------------------------------------------------------------- whisper
 model = None
+_transcribe_lock = threading.Lock()
 
 
 def load_model(log=log):
@@ -220,17 +232,18 @@ def get_vocab():
 
 def transcribe(audio: np.ndarray) -> str:
     vocab = get_vocab()
-    segments, _info = model.transcribe(
-        audio,
-        language=CFG["language"] or None,
-        beam_size=CFG.get("beam_size", 2),
-        vad_filter=True,
-        # pad around detected speech so quiet word starts/ends aren't clipped
-        vad_parameters={"min_silence_duration_ms": 500, "speech_pad_ms": 400,
-                        "threshold": 0.35},
-        hotwords=" ".join(vocab) if vocab else None,
-    )
-    return " ".join(s.text.strip() for s in segments).strip()
+    with _transcribe_lock:
+        segments, _info = model.transcribe(
+            audio,
+            language=CFG["language"] or None,
+            beam_size=CFG.get("beam_size", 2),
+            vad_filter=True,
+            # pad around detected speech so quiet word starts/ends aren't clipped
+            vad_parameters={"min_silence_duration_ms": 500, "speech_pad_ms": 400,
+                            "threshold": 0.35},
+            hotwords=" ".join(vocab) if vocab else None,
+        )
+        return " ".join(s.text.strip() for s in segments).strip()
 
 
 # ---------------------------------------------------------------- ollama cleanup
@@ -238,17 +251,35 @@ CLEANUP_PROMPT = (
     "You clean up dictated text. Remove filler words (um, uh, you know, like), "
     "fix punctuation and capitalization, and apply spoken commands such as "
     "'new line', 'new paragraph', 'comma', 'period' when clearly intended as commands. "
-    "Do NOT change wording, do NOT summarize, do NOT add anything. "
+    "Do NOT change wording, perspective, pronouns, or meaning. For example, "
+    "never change 'my' to 'your' or 'yours'. Do NOT summarize or add anything. "
     "Return ONLY the cleaned text with no preamble or quotes."
 )
+
+
+def is_cleanup_preserving(raw: str, cleaned: str) -> bool:
+    """Allow punctuation and hesitation removal, but never word substitutions."""
+    raw_words = re.findall(r"[a-z0-9]+", raw.lower())
+    cleaned_words = re.findall(r"[a-z0-9]+", cleaned.lower())
+    removable_fillers = {"um", "uh", "er", "ah"}
+    matcher = SequenceMatcher(None, raw_words, cleaned_words, autojunk=False)
+
+    for tag, raw_start, raw_end, _, _ in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        if tag == "delete" and all(word in removable_fillers
+                                   for word in raw_words[raw_start:raw_end]):
+            continue
+        return False
+    return True
 
 
 def cleanup(text: str) -> str:
     if not CFG["cleanup_enabled"] or not text:
         return text
-    # custom Modelfile builds (flowlocal-*) have the system prompt baked in
-    msgs = ([] if CFG["ollama_model"].startswith("flowlocal")
-            else [{"role": "system", "content": CLEANUP_PROMPT}])
+    # Send the contract with every request so it remains authoritative even
+    # when an older custom Ollama model has a stale baked-in system prompt.
+    msgs = [{"role": "system", "content": CLEANUP_PROMPT}]
     msgs.append({"role": "user", "content": text})
     try:
         r = requests.post(
@@ -263,9 +294,11 @@ def cleanup(text: str) -> str:
         )
         r.raise_for_status()
         cleaned = r.json()["message"]["content"].strip()
-        # Sanity: LLM went off the rails -> keep original
-        if cleaned and 0.3 < len(cleaned) / max(len(text), 1) < 3.0:
+        # Preserve dictation if the model begins answering instead of cleaning.
+        if (cleaned and 0.3 < len(cleaned) / max(len(text), 1) < 3.0
+                and is_cleanup_preserving(text, cleaned)):
             return cleaned
+        log("cleanup rejected non-preserving model output")
     except Exception as e:
         log(f"Ollama cleanup skipped: {e}")
     return text
@@ -397,6 +430,32 @@ def inject_text(text: str):
         threading.Thread(target=_restore, daemon=True).start()
 
 
+# ---------------------------------------------------------------- submit trigger
+def strip_submit_trigger(text: str) -> tuple[str, bool]:
+    """Remove a spoken final submit phrase and report whether to press Enter."""
+    phrase = CFG.get("submit_trigger_phrase", "").strip()
+    if not CFG.get("submit_trigger_enabled", False) or not phrase:
+        return text, False
+    match = re.search(
+        rf"(?:\s*[,;:\-]?\s*){re.escape(phrase)}\s*[.!?]*\s*$",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return text, False
+    return text[:match.start()].rstrip(), True
+
+
+def has_submit_trigger(text: str) -> bool:
+    """Check partial speech recognition for the configured final phrase."""
+    phrase = CFG.get("submit_trigger_phrase", "").strip()
+    if not phrase:
+        return False
+    normalized_text = re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
+    normalized_phrase = re.sub(r"[^a-z0-9]+", " ", phrase.lower()).strip()
+    return normalized_phrase in normalized_text
+
+
 # ---------------------------------------------------------------- feedback
 def beep(kind: str):
     if not CFG["beep_feedback"]:
@@ -408,19 +467,44 @@ def beep(kind: str):
 
 
 # ---------------------------------------------------------------- pipeline
-_rec_mode = "dictate"  # or "ask"
+_rec_mode = "dictate"  # mode captured when recording begins
+_voice_submit_stop = None
 
 
-def start_recording(mode="dictate"):
-    global _rec_mode
+def _monitor_voice_submit(stop_event: threading.Event):
+    """Stop normal dictation after Whisper hears the final submit phrase."""
+    interval = CFG.get("voice_submit_check_interval_sec", 1.5)
+    window_sec = CFG.get("voice_submit_audio_window_sec", 8)
+    while not stop_event.wait(interval):
+        if get_state() != State.RECORDING:
+            return
+        try:
+            partial = transcribe(recorder.snapshot(window_sec))
+            if has_submit_trigger(partial):
+                log(f"voice submit trigger heard: {partial!r}")
+                stop_and_process()
+                return
+        except Exception as e:
+            log(f"voice submit monitor skipped: {e}")
+
+
+def start_recording(mode=None):
+    global _rec_mode, _voice_submit_stop
     if get_state() != State.IDLE:
         return
-    _rec_mode = mode
+    _rec_mode = mode or CFG.get("recording_mode", "dictate")
+    if _rec_mode not in ("dictate", "ask"):
+        _rec_mode = "dictate"
     set_state(State.RECORDING)
     beep("start")
     try:
         recorder.start()
         log("recording started")
+        if (_rec_mode == "dictate" and CFG.get("voice_submit_trigger_enabled", True)):
+            _voice_submit_stop = threading.Event()
+            threading.Thread(
+                target=_monitor_voice_submit, args=(_voice_submit_stop,), daemon=True
+            ).start()
     except Exception as e:
         log(f"Mic error: {e}")
         beep("error")
@@ -428,8 +512,12 @@ def start_recording(mode="dictate"):
 
 
 def stop_and_process():
+    global _voice_submit_stop
     if get_state() != State.RECORDING:
         return
+    if _voice_submit_stop is not None:
+        _voice_submit_stop.set()
+        _voice_submit_stop = None
     set_state(State.PROCESSING)
     beep("stop")
 
@@ -456,11 +544,21 @@ def stop_and_process():
                 log("pipeline: ask answered")
                 return
             save_training_pair(audio, raw_text)
+            text, should_submit = strip_submit_trigger(raw_text)
+            if not text:
+                log("pipeline: submit trigger without dictation, skipped")
+                return
             t1 = time.time()
-            text = cleanup(raw_text)
+            text = cleanup(text)
             log(f"pipeline: cleanup done in {time.time()-t1:.1f}s -> {text!r}")
             inject_text(text)
             log("pipeline: injected")
+            if should_submit:
+                # Let the destination application receive the clipboard paste
+                # before submitting its input with Enter.
+                time.sleep(0.1)
+                keyboard.send("enter")
+                log("pipeline: submitted")
             _emit("transcript", text)
             append_to_vault(text)
         except Exception as e:

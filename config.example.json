@@ -1,6 +1,7 @@
 {
   "hold_hotkey": "right ctrl",
   "toggle_hotkey": "ctrl+shift+space",
+  "recording_mode": "dictate",
   "whisper_model": "distil-large-v3",
   "device": "auto",
   "language": "en",
@@ -14,6 +15,11 @@
   "sample_rate": 16000,
   "beep_feedback": true,
   "restore_clipboard": true,
+  "submit_trigger_enabled": true,
+  "submit_trigger_phrase": "send it flow",
+  "voice_submit_trigger_enabled": true,
+  "voice_submit_check_interval_sec": 1.5,
+  "voice_submit_audio_window_sec": 8,
   "ask_hotkey": "ctrl+alt+space",
   "rag_urls": [
     "http://localhost:8787"

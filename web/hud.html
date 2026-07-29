@@ -97,6 +97,9 @@ body {
 .cfgrow select:focus, .cfgrow input:focus { border-color:#00C2FF; }
 .tog { color:#00C2FF; letter-spacing:.1em; cursor:pointer; }
 .tog.off { color:#5E8496; }
+.mode { min-width:98px; padding:4px 7px; border:1px solid rgba(0,194,255,.35); color:#00C2FF;
+  background:rgba(0,194,255,.07); font:inherit; font-size:10px; letter-spacing:.08em; cursor:pointer; }
+.mode.ask { border-color:#F0B83A; color:#F0B83A; background:rgba(240,184,58,.08); }
 
 #saveBtn { padding:7px 20px; background:linear-gradient(180deg,#4FDCFF,#00A9E8); color:#04080B;
   font-size:10px; font-weight:600; letter-spacing:.2em; border:none; cursor:pointer; font-family:inherit;
@@ -165,6 +168,7 @@ body {
       <div class="cfgrow"><span class="k">WHISPER.MODEL</span><select id="cfgModel"></select></div>
       <div class="cfgrow"><span class="k">HOLD.KEY</span><input type="text" id="cfgHold"></div>
       <div class="cfgrow"><span class="k">TOGGLE.KEY</span><input type="text" id="cfgToggle"></div>
+      <div class="cfgrow"><span class="k">INPUT.MODE</span><button class="mode" id="cfgMode" onclick="flipMode()">DICTATE</button></div>
       <div class="cfgrow"><span class="k">AI.CLEANUP</span><span class="tog" id="cfgCleanup" onclick="flip('cfgCleanup')">[ ON ]</span></div>
       <div class="cfgrow"><span class="k">OLLAMA.MODEL</span><select id="cfgOllama"></select></div>
       <div class="cfgrow"><span class="k">VAULT.LOG</span><span class="tog" id="cfgVault" onclick="flip('cfgVault')">[ OFF ]</span></div>
@@ -206,6 +210,7 @@ window.addEventListener('pywebviewready', async () => {
   $('cfgModel').innerHTML = MODELS.map(m => `<option ${m===CFG.whisper_model?'selected':''}>${m}</option>`).join('');
   if (!MODELS.includes(CFG.whisper_model)) $('cfgModel').innerHTML += `<option selected>${CFG.whisper_model}</option>`;
   $('cfgHold').value = CFG.hold_hotkey; $('cfgToggle').value = CFG.toggle_hotkey;
+  setMode(CFG.recording_mode || 'dictate');
   // ollama dropdown: installed models from the daemon, current value always present
   let om = init.ollama_models || [];
   if (!om.includes(CFG.ollama_model)) om = [CFG.ollama_model, ...om];
@@ -271,6 +276,17 @@ tb.addEventListener('pointerdown', e => {
 
 // ---------------- controls ----------------
 function setTog(id, on) { const el = $(id); el.textContent = on ? '[ ON ]' : '[ OFF ]'; el.classList.toggle('off', !on); }
+function setMode(mode) {
+  const el = $('cfgMode'), ask = mode === 'ask';
+  el.textContent = ask ? 'ASK.AGENT' : 'DICTATE';
+  el.classList.toggle('ask', ask);
+}
+async function flipMode() {
+  const next = $('cfgMode').textContent === 'DICTATE' ? 'ask' : 'dictate';
+  const result = await api('set_recording_mode', next);
+  setMode(result.mode);
+  onLog(result.mode === 'ask' ? 'INPUT.MODE · ASK.AGENT' : 'INPUT.MODE · DICTATE');
+}
 function flip(id) {
   const on = $(id).textContent.includes('ON');
   setTog(id, !on);
