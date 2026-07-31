@@ -27,6 +27,7 @@ Commercial dictation tools ship your voice to someone else's cloud and charge mo
 
 - **Hold-to-talk dictation** — hold Right Ctrl, speak, release; text appears at your cursor in any Windows app. Toggle mode (Ctrl+Shift+Space) for hands-free.
 - **Input mode toggle** — the UI switches normal hold/toggle recording between **Dictate** (cleaned transcript) and **Ask Agent** (RAG answer). The separate ask hotkey remains available as an explicit shortcut.
+- **Voice wake trigger** — say **“Hey Flow”** to start normal recording without replacing the F24 toggle control.
 - **GPU transcription** — faster-whisper `distil-large-v3` with CUDA, CPU fallback. Custom vocabulary boosting for domain terms.
 - **LLM cleanup pass** — a fine-tune-prompted Ollama model strips filler words and fixes punctuation before pasting. Auto-skipped when Ollama isn't running.
 - **Ask mode** — dictate a question, get an answer synthesized from *your own notes* via a local RAG service, pasted and read aloud through [tts-daemon](https://github.com/wtcrowe4/tts-daemon) (local Kokoro neural TTS).
@@ -60,6 +61,7 @@ Commercial dictation tools ship your voice to someone else's cloud and charge mo
 - **Ctrl+Alt+Space** ask mode → dictate a question, answer is pasted + spoken
 - In the UI, click **INPUT.MODE** to switch normal recording between **DICTATE** and **ASK.AGENT**
 - In **DICTATE** mode, say **“Send It Flow”** to stop recording, remove the phrase, paste the transcript, and press Enter
+- Say **“Hey Flow”** while FlowLocal is idle to start recording hands-free
 - Tray icon: gray = idle, red = recording, yellow = processing
 - Beeps confirm start/stop (disable in config)
 
@@ -72,6 +74,8 @@ Copy `config.example.json` to `config.json` and adjust — `config.json` is mach
 | `hold_hotkey` | `right ctrl` | Hold-to-talk key ([key names](https://github.com/boppreh/keyboard)) |
 | `toggle_hotkey` | `ctrl+shift+space` | Toggle mode |
 | `recording_mode` | `dictate` | Mode for normal hold/toggle recording: `dictate` or `ask` |
+| `wake_trigger_enabled` | `true` | Listen locally for the idle wake phrase |
+| `wake_trigger_phrase` | `hey flow` | Phrase that begins normal dictation |
 | `submit_trigger_phrase` | `send it flow` | Final dictation phrase that is removed before submitting |
 | `ask_hotkey` | `ctrl+alt+space` | Ask mode (RAG Q&A) |
 | `whisper_model` | `distil-large-v3` | Smaller/faster: `small.en`, `base.en` |

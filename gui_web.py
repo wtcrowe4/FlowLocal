@@ -162,6 +162,15 @@ class Api:
         app.CONFIG_PATH.write_text(json.dumps(app.CFG, indent=2), encoding="utf-8")
         return {"mode": mode}
 
+    def set_wake_trigger(self, enabled):
+        app.CFG["wake_trigger_enabled"] = bool(enabled)
+        app.CONFIG_PATH.write_text(json.dumps(app.CFG, indent=2), encoding="utf-8")
+        if enabled:
+            app.wake_listener.start()
+        else:
+            app.wake_listener.stop()
+        return {"enabled": app.CFG["wake_trigger_enabled"]}
+
     def move_by(self, which, dx, dy):
         """Drag: JS streams pointer deltas, we move the window. Native drag
         hand-off (WM_NCLBUTTONDOWN) doesn't work - WebView2 child owns the mouse."""

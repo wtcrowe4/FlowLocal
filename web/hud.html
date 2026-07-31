@@ -168,6 +168,7 @@ body {
       <div class="cfgrow"><span class="k">WHISPER.MODEL</span><select id="cfgModel"></select></div>
       <div class="cfgrow"><span class="k">HOLD.KEY</span><input type="text" id="cfgHold"></div>
       <div class="cfgrow"><span class="k">TOGGLE.KEY</span><input type="text" id="cfgToggle"></div>
+      <div class="cfgrow"><span class="k">WAKE.HEY.FLOW</span><span class="tog" id="cfgWake" onclick="flip('cfgWake')">[ ON ]</span></div>
       <div class="cfgrow"><span class="k">INPUT.MODE</span><button class="mode" id="cfgMode" onclick="flipMode()">DICTATE</button></div>
       <div class="cfgrow"><span class="k">AI.CLEANUP</span><span class="tog" id="cfgCleanup" onclick="flip('cfgCleanup')">[ ON ]</span></div>
       <div class="cfgrow"><span class="k">OLLAMA.MODEL</span><select id="cfgOllama"></select></div>
@@ -211,6 +212,7 @@ window.addEventListener('pywebviewready', async () => {
   if (!MODELS.includes(CFG.whisper_model)) $('cfgModel').innerHTML += `<option selected>${CFG.whisper_model}</option>`;
   $('cfgHold').value = CFG.hold_hotkey; $('cfgToggle').value = CFG.toggle_hotkey;
   setMode(CFG.recording_mode || 'dictate');
+  setTog('cfgWake', CFG.wake_trigger_enabled);
   // ollama dropdown: installed models from the daemon, current value always present
   let om = init.ollama_models || [];
   if (!om.includes(CFG.ollama_model)) om = [CFG.ollama_model, ...om];
@@ -293,6 +295,7 @@ function flip(id) {
   if (id === 'cfgCleanup') api('set_flag', 'cleanup_enabled', !on);
   if (id === 'cfgVault') api('set_flag', 'vault_append_enabled', !on);
   if (id === 'cfgTrain') api('set_flag', 'save_training_data', !on);
+  if (id === 'cfgWake') api('set_wake_trigger', !on);
 }
 async function saveConfig() {
   const r = await api('save_config', {

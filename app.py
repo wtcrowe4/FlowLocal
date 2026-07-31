@@ -178,6 +178,78 @@ class Recorder:
 
 recorder = Recorder()
 
+
+class WakeListener:
+    """Keep a short idle audio buffer for local voice-trigger recognition."""
+    def __init__(self):
+        self._chunks = []
+        self._stream = None
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = None
+
+    def _callback(self, indata, frames, t, status):
+        with self._lock:
+            self._chunks.append(indata.copy())
+            max_chunks = int(CFG.get("wake_audio_window_sec", 3) * SAMPLE_RATE / frames) + 1
+            if len(self._chunks) > max_chunks:
+                del self._chunks[:-max_chunks]
+
+    def snapshot(self) -> np.ndarray:
+        with self._lock:
+            if not self._chunks:
+                return np.zeros(0, dtype=np.float32)
+            return np.concatenate(self._chunks).flatten()
+
+    def start(self):
+        if (not CFG.get("wake_trigger_enabled", False) or self._stream
+                or get_state() != State.IDLE):
+            return
+        with self._lock:
+            self._chunks = []
+        self._stop.clear()
+        try:
+            self._stream = sd.InputStream(
+                samplerate=SAMPLE_RATE, channels=1, dtype="float32",
+                callback=self._callback,
+            )
+            self._stream.start()
+            self._thread = threading.Thread(target=self._monitor, daemon=True)
+            self._thread.start()
+            log(f"Wake trigger listening for {CFG.get('wake_trigger_phrase', 'hey flow')!r}")
+        except Exception as e:
+            self.stop()
+            log(f"Wake trigger unavailable: {e}")
+
+    def stop(self):
+        self._stop.set()
+        stream, self._stream = self._stream, None
+        if stream:
+            try:
+                stream.stop()
+                stream.close()
+            except Exception as e:
+                log(f"Wake trigger stream close failed: {e}")
+
+    def _monitor(self):
+        interval = CFG.get("wake_check_interval_sec", 1.0)
+        while not self._stop.wait(interval):
+            if get_state() != State.IDLE:
+                return
+            if tts_is_speaking():
+                continue
+            try:
+                partial = transcribe(self.snapshot())
+                if has_wake_trigger(partial):
+                    log(f"wake trigger heard: {partial!r}")
+                    start_recording()
+                    return
+            except Exception as e:
+                log(f"wake trigger monitor skipped: {e}")
+
+
+wake_listener = WakeListener()
+
 # ---------------------------------------------------------------- whisper
 model = None
 _transcribe_lock = threading.Lock()
@@ -244,6 +316,16 @@ def transcribe(audio: np.ndarray) -> str:
             hotwords=" ".join(vocab) if vocab else None,
         )
         return " ".join(s.text.strip() for s in segments).strip()
+
+
+def has_wake_trigger(text: str) -> bool:
+    """Match a configured wake phrase in local rolling transcription."""
+    phrase = CFG.get("wake_trigger_phrase", "").strip()
+    if not phrase:
+        return False
+    normalized_text = re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
+    normalized_phrase = re.sub(r"[^a-z0-9]+", " ", phrase.lower()).strip()
+    return normalized_phrase in normalized_text
 
 
 # ---------------------------------------------------------------- ollama cleanup
@@ -388,6 +470,13 @@ def ask_rag(q: str) -> str:
 
 
 # ---------------------------------------------------------------- tts (tts-daemon)
+_tts_speaking = threading.Event()
+
+
+def tts_is_speaking() -> bool:
+    return _tts_speaking.is_set()
+
+
 def tts_speak(text: str):
     """Speak text via the shared tts-daemon (Kokoro, WSL localhost:8123).
     Fire-and-forget: daemon down or disabled -> silent no-op."""
@@ -395,6 +484,7 @@ def tts_speak(text: str):
         return
 
     def _post():
+        _tts_speaking.set()
         try:
             requests.post(
                 CFG.get("tts_url", "http://127.0.0.1:8123/speak"),
@@ -403,6 +493,8 @@ def tts_speak(text: str):
             )
         except Exception as e:
             log(f"tts: daemon unreachable, skipped: {e}")
+        finally:
+            _tts_speaking.clear()
 
     threading.Thread(target=_post, daemon=True).start()
 
@@ -495,6 +587,7 @@ def start_recording(mode=None):
     _rec_mode = mode or CFG.get("recording_mode", "dictate")
     if _rec_mode not in ("dictate", "ask"):
         _rec_mode = "dictate"
+    wake_listener.stop()
     set_state(State.RECORDING)
     beep("start")
     try:
@@ -566,6 +659,7 @@ def stop_and_process():
             beep("error")
         finally:
             set_state(State.IDLE)
+            wake_listener.start()
 
     threading.Thread(target=_work, daemon=True).start()
 
@@ -631,6 +725,7 @@ def setup_hotkeys():
     if ask:
         keyboard.add_hotkey(ask, _on_ask_toggle)
         log(f"Ask (personal-rag): {ask}")
+    wake_listener.start()
 
 
 # ---------------------------------------------------------------- tray

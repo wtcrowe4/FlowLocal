@@ -1,6 +1,10 @@
 {
   "hold_hotkey": "right ctrl",
   "toggle_hotkey": "ctrl+shift+space",
+  "wake_trigger_enabled": true,
+  "wake_trigger_phrase": "hey flow",
+  "wake_check_interval_sec": 1.0,
+  "wake_audio_window_sec": 3,
   "recording_mode": "dictate",
   "whisper_model": "distil-large-v3",
   "device": "auto",
