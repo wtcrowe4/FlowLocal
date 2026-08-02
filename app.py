@@ -53,7 +53,73 @@ from PIL import Image, ImageDraw
 from faster_whisper import WhisperModel
 
 CONFIG_PATH = Path(__file__).parent / "config.json"
-CFG = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+
+# Every setting FlowLocal reads, with the value it falls back to, so a
+# config.json only has to carry overrides. Without this merge a config written
+# before a feature existed either raised KeyError on a CFG["..."] read or - far
+# worse, because it fails silently - let CFG.get(...) hand back a False/empty
+# default. That is exactly how the "hey flow" and "send it flow" triggers sat
+# inert on a config that predated them, with nothing logged.
+# Anything that opens the mic on its own or writes files defaults OFF here;
+# config.example.json is where those get switched on deliberately.
+DEFAULTS = {
+    # input
+    "hold_hotkey": "right ctrl",
+    "toggle_hotkey": "ctrl+shift+space",
+    "ask_hotkey": "ctrl+alt+space",
+    "recording_mode": "dictate",
+    # voice triggers
+    "wake_trigger_enabled": False,
+    "wake_trigger_phrase": "hey flow",
+    "wake_check_interval_sec": 1.0,
+    "wake_audio_window_sec": 3,
+    "submit_trigger_enabled": False,
+    "submit_trigger_phrase": "send it flow",
+    "voice_submit_trigger_enabled": True,
+    "voice_submit_check_interval_sec": 1.5,
+    "voice_submit_audio_window_sec": 8,
+    # transcription
+    "whisper_model": "distil-large-v3",
+    "device": "auto",
+    "language": "en",
+    "beam_size": 3,
+    "sample_rate": 16000,
+    "min_recording_sec": 0.3,
+    "max_recording_sec": 300,
+    # cleanup
+    "cleanup_enabled": True,
+    "ollama_url": "http://localhost:11434",
+    "ollama_model": "flowlocal-cleanup",
+    "ollama_timeout_sec": 15,
+    # ask mode
+    "rag_urls": [],
+    "rag_k": 5,
+    "ask_model": "llama3.1:8b",
+    "ask_timeout_sec": 30,
+    # feedback
+    "beep_feedback": True,
+    "restore_clipboard": True,
+    "tts_enabled": False,
+    "tts_url": "http://127.0.0.1:8123/speak",
+    "tts_max_chars": 1500,
+    "tts_timeout_sec": 60,
+    # opt-in side effects
+    "vault_append_enabled": False,
+    "vault_append_path": "",
+    "save_training_data": False,
+    # window chrome. pill_x/pill_y are deliberately absent - gui_web derives a
+    # screen-aware position when they are unset, which a fixed default would
+    # override and park the pill off a differently-sized monitor.
+    "window_alpha": 1.0,
+    "pill_alpha": 1.0,
+    "acrylic": False,
+}
+
+_user_cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+CFG = {**DEFAULTS, **_user_cfg}
+# Surfaced by setup_hotkeys() once log() exists, so config drift is visible
+# instead of silently degrading a feature.
+_CFG_DEFAULTED = sorted(k for k in DEFAULTS if k not in _user_cfg)
 
 SAMPLE_RATE = CFG["sample_rate"]
 
@@ -831,6 +897,9 @@ def _ask_toggle_work():
 
 
 def setup_hotkeys():
+    if _CFG_DEFAULTED:
+        log(f"config: {len(_CFG_DEFAULTED)} key(s) absent from config.json, "
+            f"using defaults: {', '.join(_CFG_DEFAULTED)}")
     hold = CFG["hold_hotkey"]
     if hold:
         # Raw hook with exact name match. on_press_key("right ctrl") resolves
