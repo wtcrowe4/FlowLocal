@@ -6,6 +6,7 @@ Hold hotkey (or toggle) -> speak -> release -> text typed into active window.
 
 import json
 import os
+import queue
 import re
 import sys
 import threading
@@ -758,6 +759,32 @@ def stop_and_process():
 # ---------------------------------------------------------------- hotkeys
 _hold_down = False
 
+# These callbacks run ON the low-level keyboard hook thread. Windows silently
+# evicts a WH_KEYBOARD_LL hook whose callback overruns LowLevelHooksTimeout
+# (~300ms by default), and once it does EVERY hotkey dies - F24 toggle and
+# right-ctrl hold alike - with no error, until the process restarts. Opening the
+# mic and stopping the wake listener are both slow enough to trip that, so the
+# hook must never do the work itself; it only queues it. A single worker keeps
+# press/release strictly ordered, which a thread-per-event would not.
+_hotkey_q = queue.Queue()
+
+
+def _hotkey_worker():
+    while True:
+        fn = _hotkey_q.get()
+        try:
+            fn()
+        except Exception as e:
+            log(f"hotkey handler ERROR: {type(e).__name__}: {e}")
+
+
+threading.Thread(target=_hotkey_worker, daemon=True).start()
+
+
+def _dispatch(fn):
+    """Hand hotkey work off the hook thread. Must stay O(microseconds)."""
+    _hotkey_q.put(fn)
+
 
 def _on_hold_press(_e):
     """Right Ctrl = pure hold-to-talk dictation. Ask mode is NOT overloaded onto
@@ -768,16 +795,23 @@ def _on_hold_press(_e):
     if _hold_down:  # key auto-repeat
         return
     _hold_down = True
-    start_recording()
+    _dispatch(start_recording)
 
 
 def _on_hold_release(_e):
     global _hold_down
+    if not _hold_down:  # release without a matching press we handled
+        return
     _hold_down = False
-    stop_and_process()  # too-short recordings are dropped by min_recording_sec
+    # too-short recordings are dropped by min_recording_sec
+    _dispatch(stop_and_process)
 
 
 def _on_toggle():
+    _dispatch(_toggle_work)
+
+
+def _toggle_work():
     if get_state() == State.RECORDING:
         stop_and_process()
     else:
@@ -786,6 +820,10 @@ def _on_toggle():
 
 def _on_ask_toggle():
     """Press once, ask your question out loud, press again -> answer typed at cursor."""
+    _dispatch(_ask_toggle_work)
+
+
+def _ask_toggle_work():
     if get_state() == State.RECORDING:
         stop_and_process()
     else:
