@@ -5,6 +5,8 @@
   "wake_trigger_phrase": "hey flow",
   "wake_check_interval_sec": 1.0,
   "wake_audio_window_sec": 3,
+  "wake_rms_threshold": 0.004,
+  "wake_debug": false,
   "recording_mode": "dictate",
   "whisper_model": "distil-large-v3",
   "device": "auto",

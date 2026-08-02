@@ -4,6 +4,7 @@ Hold hotkey (or toggle) -> speak -> release -> text typed into active window.
 100% local: faster-whisper for STT, optional Ollama for cleanup.
 """
 
+import ctypes
 import json
 import os
 import queue
@@ -73,6 +74,8 @@ DEFAULTS = {
     "wake_trigger_phrase": "hey flow",
     "wake_check_interval_sec": 1.0,
     "wake_audio_window_sec": 3,
+    "wake_debug": False,
+    "wake_rms_threshold": 0.004,
     "submit_trigger_enabled": False,
     "submit_trigger_phrase": "send it flow",
     "voice_submit_trigger_enabled": True,
@@ -300,13 +303,37 @@ class WakeListener:
 
     def _monitor(self):
         interval = CFG.get("wake_check_interval_sec", 1.0)
+        # wake_debug logs every cycle: how much audio the idle stream holds, its
+        # level, and what Whisper made of it. Without it a wake miss is totally
+        # silent - there is no way to tell a dead mic stream from a mis-heard
+        # phrase from a listener that never ran.
+        debug = CFG.get("wake_debug", False)
         while not self._stop.wait(interval):
             if get_state() != State.IDLE:
                 return
             if tts_is_speaking():
+                if debug:
+                    log("wake: skipped (tts speaking)")
                 continue
             try:
-                partial = transcribe(self.snapshot())
+                audio = self.snapshot()
+                rms = float(np.sqrt(np.mean(np.square(audio)))) if audio.size else 0.0
+                # Gate on loudness before spending a Whisper pass. Running the
+                # model every idle second pinned the GPU continuously, and a
+                # machine that busy stops scheduling the keyboard hook thread
+                # inside its ~300ms deadline - so Windows evicted the hook and
+                # every hotkey died. It also made Whisper hallucinate ("Thank
+                # you.") out of room tone, which is a false trigger waiting to
+                # happen. Measured: speech sits at 0.008-0.015, silence <0.001.
+                if rms < CFG.get("wake_rms_threshold", 0.004):
+                    if debug:
+                        log(f"wake: {audio.size / SAMPLE_RATE:4.1f}s "
+                            f"rms={rms:.4f} - below threshold, not transcribed")
+                    continue
+                partial = transcribe(audio)
+                if debug:
+                    log(f"wake: {audio.size / SAMPLE_RATE:4.1f}s rms={rms:.4f} "
+                        f"-> {partial!r}")
                 if has_wake_trigger(partial):
                     log(f"wake trigger heard: {partial!r}")
                     start_recording()
@@ -896,10 +923,33 @@ def _ask_toggle_work():
         start_recording("ask")
 
 
-def setup_hotkeys():
-    if _CFG_DEFAULTED:
-        log(f"config: {len(_CFG_DEFAULTED)} key(s) absent from config.json, "
-            f"using defaults: {', '.join(_CFG_DEFAULTED)}")
+_last_hook_event = 0.0
+
+
+def _note_hook_event(_e=None):
+    """Liveness probe. Runs on the hook thread, so it must stay trivial."""
+    global _last_hook_event
+    _last_hook_event = time.time()
+
+
+class _LASTINPUTINFO(ctypes.Structure):
+    _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
+
+
+def _system_idle_sec() -> float:
+    """Seconds since Windows last saw any real user input, hook or not."""
+    info = _LASTINPUTINFO()
+    info.cbSize = ctypes.sizeof(info)
+    if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(info)):
+        return 0.0
+    return max(0.0, (ctypes.windll.kernel32.GetTickCount() - info.dwTime) / 1000.0)
+
+
+def _install_key_hooks():
+    """(Re)install every keyboard hook. Safe to call repeatedly - the watchdog
+    calls it to recover a hook Windows threw away."""
+    keyboard.unhook_all()
+    keyboard.hook(_note_hook_event)
     hold = CFG["hold_hotkey"]
     if hold:
         # Raw hook with exact name match. on_press_key("right ctrl") resolves
@@ -914,15 +964,51 @@ def setup_hotkeys():
                 _on_hold_release(e)
 
         keyboard.hook(_hold_hook)
-        log(f"Hold-to-talk: {hold}")
     tog = CFG["toggle_hotkey"]
     if tog:
         keyboard.add_hotkey(tog, _on_toggle)
-        log(f"Toggle: {tog}")
     ask = CFG.get("ask_hotkey")
     if ask:
         keyboard.add_hotkey(ask, _on_ask_toggle)
-        log(f"Ask (personal-rag): {ask}")
+    _note_hook_event()
+
+
+def _hook_watchdog():
+    """Windows evicts a low-level keyboard hook whose callback misses its
+    ~300ms deadline - including when the machine is merely too busy for the
+    hook thread to be scheduled. Nothing raises and nothing is logged; every
+    hotkey simply stops working until restart. This is how the F24 toggle kept
+    "detaching".
+
+    There is no API to ask whether our hook is still installed, so infer it:
+    if Windows says the user is actively typing/clicking but our hook has seen
+    nothing for a while, the hook is gone. Reinstall it."""
+    while True:
+        time.sleep(30)
+        try:
+            active = _system_idle_sec() < 25
+            silent_for = time.time() - _last_hook_event
+            if active and silent_for > 90:
+                log(f"keyboard hook evicted (no events in {silent_for:.0f}s "
+                    f"while user active) - reinstalling")
+                _install_key_hooks()
+        except Exception as e:
+            log(f"hook watchdog error: {type(e).__name__}: {e}")
+
+
+def setup_hotkeys():
+    if _CFG_DEFAULTED:
+        log(f"config: {len(_CFG_DEFAULTED)} key(s) absent from config.json, "
+            f"using defaults: {', '.join(_CFG_DEFAULTED)}")
+    _install_key_hooks()
+    if CFG["hold_hotkey"]:
+        log(f"Hold-to-talk: {CFG['hold_hotkey']}")
+    if CFG["toggle_hotkey"]:
+        log(f"Toggle: {CFG['toggle_hotkey']}")
+    if CFG.get("ask_hotkey"):
+        log(f"Ask (personal-rag): {CFG['ask_hotkey']}")
+    threading.Thread(target=_hook_watchdog, daemon=True).start()
+    log("hook watchdog armed")
     wake_listener.start()
 
 
