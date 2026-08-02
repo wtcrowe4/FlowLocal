@@ -34,6 +34,16 @@ win_main = None
 win_pill = None
 
 PILL_W, PILL_H = 260, 22
+PILL_MARGIN = 3
+
+
+class MonitorInfo(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", ctypes.c_uint),
+        ("rcMonitor", wintypes.RECT),
+        ("rcWork", wintypes.RECT),
+        ("dwFlags", ctypes.c_uint),
+    ]
 
 
 def _single_instance():
@@ -59,6 +69,30 @@ def js(code, target=None):
 # ---------------------------------------------------------------- win32 helpers
 def _hwnd(title):
     return ctypes.windll.user32.FindWindowW(None, title)
+
+
+def _constrain_pill_position(x, y):
+    """Keep the pill entirely in the monitor work area, above its taskbar."""
+    point = wintypes.POINT(int(x) + PILL_W // 2, int(y) + PILL_H // 2)
+    monitor = ctypes.windll.user32.MonitorFromPoint(point, 2)  # nearest monitor
+    info = MonitorInfo()
+    info.cbSize = ctypes.sizeof(info)
+
+    if monitor and ctypes.windll.user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+        work = info.rcWork
+    else:
+        work = wintypes.RECT(
+            0, 0,
+            ctypes.windll.user32.GetSystemMetrics(0),
+            ctypes.windll.user32.GetSystemMetrics(1),
+        )
+
+    max_x = max(work.left + PILL_MARGIN, work.right - PILL_W - PILL_MARGIN)
+    max_y = max(work.top + PILL_MARGIN, work.bottom - PILL_H - PILL_MARGIN)
+    return (
+        min(max(int(x), work.left + PILL_MARGIN), max_x),
+        min(max(int(y), work.top + PILL_MARGIN), max_y),
+    )
 
 
 def _hide_from_taskbar(title):
@@ -176,13 +210,19 @@ class Api:
         hand-off (WM_NCLBUTTONDOWN) doesn't work - WebView2 child owns the mouse."""
         w = win_main if which == "main" else win_pill
         try:
-            w.move(w.x + int(dx), w.y + int(dy))
+            x, y = w.x + int(dx), w.y + int(dy)
+            if which == "pill":
+                x, y = _constrain_pill_position(x, y)
+            w.move(x, y)
         except Exception:
             pass
 
     def save_pill_pos(self):
         try:
-            app.CFG["pill_x"], app.CFG["pill_y"] = win_pill.x, win_pill.y
+            x, y = _constrain_pill_position(win_pill.x, win_pill.y)
+            if (x, y) != (win_pill.x, win_pill.y):
+                win_pill.move(x, y)
+            app.CFG["pill_x"], app.CFG["pill_y"] = x, y
             app.CONFIG_PATH.write_text(json.dumps(app.CFG, indent=2), encoding="utf-8")
         except Exception:
             pass
@@ -278,14 +318,21 @@ def main():
     # min_size MUST be passed - pywebview defaults it to (200,100) and clamps the
     # 18px-tall pill up to 100px, which was most of the "gray box".
     sh = ctypes.windll.user32.GetSystemMetrics(1)
-    px = app.CFG.get("pill_x") or 240
-    py = app.CFG.get("pill_y") or (sh - PILL_H - 3)  # vertically centered in taskbar
+    saved_px = app.CFG.get("pill_x", 240)
+    saved_py = app.CFG.get("pill_y", sh - PILL_H - PILL_MARGIN)
+    px, py = _constrain_pill_position(saved_px, saved_py)
+    if (px, py) != (saved_px, saved_py):
+        app.CFG["pill_x"], app.CFG["pill_y"] = px, py
+        app.CONFIG_PATH.write_text(json.dumps(app.CFG, indent=2), encoding="utf-8")
     win_pill = webview.create_window(
         "FlowLocal Pill", str(web / "pill.html"),
         width=PILL_W, height=PILL_H, x=px, y=py, min_size=(PILL_W, PILL_H),
         frameless=True, easy_drag=False, resizable=False,
         on_top=True, background_color=PILL_BG, js_api=api,
     )
+    # Closing the main window must also end the pill and release the instance
+    # mutex. Otherwise the invisible background process blocks future launches.
+    win_main.events.closed += _hard_exit
 
     def on_start():
         time.sleep(0.6)  # let both windows materialize before touching hwnds

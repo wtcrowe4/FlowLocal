@@ -63,6 +63,7 @@ Commercial dictation tools ship your voice to someone else's cloud and charge mo
 - In **DICTATE** mode, say **“Send It Flow”** to stop recording, remove the phrase, paste the transcript, and press Enter
 - Say **“Hey Flow”** while FlowLocal is idle to start recording hands-free
 - Tray icon: gray = idle, red = recording, yellow = processing
+- The **–** button hides the main window while FlowLocal keeps running; **✕** or tray **Quit** stops it completely
 - Beeps confirm start/stop (disable in config)
 
 ## Config (`config.json`)
