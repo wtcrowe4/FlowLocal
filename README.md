@@ -51,7 +51,7 @@ Commercial dictation tools ship your voice to someone else's cloud and charge mo
 
 1. Run `install.bat` (needs Python 3.10+)
 2. Copy `config.example.json` → `config.json` and adjust — `config.json` is machine-specific and untracked
-3. Optional cleanup pass: install [Ollama](https://ollama.com), then `ollama pull llama3.2:3b`
+3. Optional cleanup pass: install [Ollama](https://ollama.com), then build a cleanup model (see [Cleanup models](#cleanup-models))
 4. Run `run.bat` (GUI) or `run_headless.bat` (console + tray). First launch downloads the Whisper model (~1.5 GB), one time only. If download fails, run `download_model.bat`.
 
 ## Use
@@ -82,10 +82,41 @@ Copy `config.example.json` to `config.json` and adjust — `config.json` is mach
 | `whisper_model` | `distil-large-v3` | Smaller/faster: `small.en`, `base.en` |
 | `device` | `auto` | `cuda`, `cpu`, or `auto` (GPU with CPU fallback) |
 | `cleanup_enabled` | `true` | Ollama pass; auto-skipped if Ollama not running |
-| `ollama_model` | `llama3.2:3b` | Any local model |
+| `ollama_model` | `flowlocal-cleanup` | Any local model — see [Cleanup models](#cleanup-models) |
 | `tts_enabled` | `true` | Speak ask-mode answers via tts-daemon |
 | `tts_url` | `http://127.0.0.1:8123/speak` | tts-daemon endpoint |
 | `restore_clipboard` | `true` | Puts old clipboard back after paste |
+
+## Cleanup models
+
+The cleanup pass strips filler words, fixes punctuation and capitalization, and turns
+spoken commands (`comma`, `period`, `new line`) into real marks. Every result is checked
+against the raw transcript first: the model may delete filler and stutters, but any
+reworded, reordered, or added text is rejected and the raw transcript is pasted instead.
+That guard is why the model can never quietly answer your dictation or flip `my` to `your`.
+
+Build whichever tier fits your GPU, then pick it in the GUI:
+
+```
+ollama create flowlocal-cleanup       -f Modelfile          # 3B  — default
+ollama create flowlocal-cleanup-8b    -f Modelfile.8b       # 8B
+ollama create flowlocal-cleanup-gemma -f Modelfile.gemma    # best quality
+```
+
+Measured on an RTX 5080 over an 8-phrase dictation set — *accepted* is how often the
+cleanup survived the guard, *polished* how often it also had correct capitalization
+and end punctuation:
+
+| Model | VRAM | Accepted | Polished | Median (warm) |
+|---|---|---|---|---|
+| `flowlocal-cleanup-gemma` | ~6 GB | 8/8 | 8/8 | 0.5 s |
+| `flowlocal-cleanup-8b` | ~5 GB | 5/8 | 5/8 | 0.3 s |
+| `flowlocal-cleanup` (3B) | ~2 GB | 5/8 | 5/8 | 0.3 s |
+
+The gemma tier is the only one that reliably converts spoken punctuation, writes spoken
+sizes as numerals, and refuses to answer a dictated question. It needs headroom beyond
+Whisper's VRAM, so on an 8 GB GPU stay on the 3B default. `flowlocal-cleanup` remains the
+shipped default so a fresh clone works everywhere.
 
 ## Troubleshooting
 

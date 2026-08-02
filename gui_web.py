@@ -174,6 +174,7 @@ def _apply_acrylic(title, tint=0x55070D10):  # AABBGGRR - light smoke, mostly gl
 # curated dropdown - Thomas runs many Ollama models for other projects,
 # only these are relevant to dictation (edit ollama_model_choices in config.json)
 OLLAMA_CHOICES = ["flowlocal-cleanup", "flowlocal-cleanup-8b",
+                  "flowlocal-cleanup-gemma",  # best cleanup, needs ~6GB VRAM
                   "llama3.2:3b", "llama3.1:8b"]
 
 

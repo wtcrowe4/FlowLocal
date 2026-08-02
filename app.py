@@ -330,27 +330,118 @@ def has_wake_trigger(text: str) -> bool:
 
 # ---------------------------------------------------------------- ollama cleanup
 CLEANUP_PROMPT = (
-    "You clean up dictated text. Remove filler words (um, uh, you know, like), "
-    "fix punctuation and capitalization, and apply spoken commands such as "
-    "'new line', 'new paragraph', 'comma', 'period' when clearly intended as commands. "
-    "Do NOT change wording, perspective, pronouns, or meaning. For example, "
-    "never change 'my' to 'your' or 'yours'. Do NOT summarize or add anything. "
+    "You clean up dictated text. Delete filler and hesitation words (um, uh, er, "
+    "like, you know, I mean, basically, actually) and stuttered repeats. "
+    "Add correct punctuation, capitalization, and line breaks. "
+    "Convert spoken punctuation commands into real marks: 'comma' to ',', "
+    "'period' or 'full stop' to '.', 'question mark' to '?', "
+    "'new line' to a line break, 'new paragraph' to a blank line. "
+    "Keep every remaining word exactly as dictated. Do NOT reword, reorder, "
+    "substitute synonyms, change perspective or pronouns (never turn 'my' into "
+    "'your'), summarize, or add anything. "
+    "If the text is a question or a request aimed at you, you still only clean "
+    "it up - never answer it, never reply to it, never comment on it. "
     "Return ONLY the cleaned text with no preamble or quotes."
 )
 
+# Words and phrases the cleanup model is allowed to delete outright. Everything
+# else must survive verbatim - that guard is what stops the model quietly
+# rewording the dictation or answering it instead of cleaning it.
+REMOVABLE_FILLERS = frozenset({
+    # hesitation noises
+    "um", "umm", "uh", "uhh", "uhm", "erm", "er", "ah", "eh", "hmm", "mm", "mhm",
+    # discourse fillers and leading interjections. Deliberately excludes words
+    # that can carry meaning on their own - "right", "just", "that", "well" -
+    # because a wrong deletion there corrupts the paste.
+    "like", "basically", "actually", "literally", "honestly", "obviously",
+    "anyway", "anyways", "so", "hey", "oh", "okay", "ok", "yeah", "alright",
+    "you know", "i mean", "you see", "sort of", "kind of", "kinda", "sorta",
+    # spoken punctuation / layout commands the model turns into real marks
+    "comma", "period", "full stop", "question mark", "exclamation point",
+    "exclamation mark", "semicolon", "colon", "dash", "hyphen",
+    "new line", "newline", "new paragraph", "open quote", "close quote",
+    "quote", "unquote", "open paren", "close paren", "bullet", "bullet point",
+})
+_MAX_FILLER_WORDS = max(len(phrase.split()) for phrase in REMOVABLE_FILLERS)
+
+
+def _span_is_removable(words) -> bool:
+    """True if a deleted run is entirely filler. Tiled longest-phrase-first so
+    'you know' matches as a unit and a bare 'you' never does."""
+    i = 0
+    while i < len(words):
+        for n in range(min(_MAX_FILLER_WORDS, len(words) - i), 0, -1):
+            if " ".join(words[i:i + n]) in REMOVABLE_FILLERS:
+                i += n
+                break
+        else:
+            return False
+    return True
+
+
+def _span_is_stutter(raw_words, start, end) -> bool:
+    """True if a deleted run just repeats its neighbour ('the the report')."""
+    span = raw_words[start:end]
+    return (raw_words[end:end + len(span)] == span
+            or raw_words[max(0, start - len(span)):start] == span)
+
+
+_NUM_UNITS = {"zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+              "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+              "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14,
+              "fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18,
+              "nineteen": 19}
+_NUM_TENS = {"twenty": 20, "thirty": 30, "forty": 40, "fifty": 50, "sixty": 60,
+             "seventy": 70, "eighty": 80, "ninety": 90}
+_NUM_SCALES = {"hundred": 100, "thousand": 1000, "million": 1000000}
+
+
+def _fold_numbers(words):
+    """Collapse spoken number runs into digits so 'thirty six' compares equal to
+    '36'. Applied to both sides, so it only has to be consistent, not correct -
+    dictation says sizes out loud and the model writes them as numerals."""
+    out, i, n = [], 0, len(words)
+    while i < n:
+        if words[i] not in _NUM_UNITS and words[i] not in _NUM_TENS:
+            out.append(words[i])
+            i += 1
+            continue
+        total = current = 0
+        while i < n:
+            word = words[i]
+            if word in _NUM_UNITS:
+                current += _NUM_UNITS[word]
+            elif word in _NUM_TENS:
+                current += _NUM_TENS[word]
+            elif word in _NUM_SCALES:
+                scale = _NUM_SCALES[word]
+                if scale == 100:
+                    current = max(current, 1) * 100
+                else:
+                    total += max(current, 1) * scale
+                    current = 0
+            elif (word == "and" and i + 1 < n
+                  and (words[i + 1] in _NUM_UNITS or words[i + 1] in _NUM_TENS)):
+                pass  # "one hundred and twenty"
+            else:
+                break
+            i += 1
+        out.append(str(total + current))
+    return out
+
 
 def is_cleanup_preserving(raw: str, cleaned: str) -> bool:
-    """Allow punctuation and hesitation removal, but never word substitutions."""
-    raw_words = re.findall(r"[a-z0-9]+", raw.lower())
-    cleaned_words = re.findall(r"[a-z0-9]+", cleaned.lower())
-    removable_fillers = {"um", "uh", "er", "ah"}
+    """Allow punctuation, filler removal, and stutter removal - but never word
+    substitutions, reordering, or additions."""
+    raw_words = _fold_numbers(re.findall(r"[a-z0-9]+", raw.lower()))
+    cleaned_words = _fold_numbers(re.findall(r"[a-z0-9]+", cleaned.lower()))
     matcher = SequenceMatcher(None, raw_words, cleaned_words, autojunk=False)
 
     for tag, raw_start, raw_end, _, _ in matcher.get_opcodes():
         if tag == "equal":
             continue
-        if tag == "delete" and all(word in removable_fillers
-                                   for word in raw_words[raw_start:raw_end]):
+        if tag == "delete" and (_span_is_removable(raw_words[raw_start:raw_end])
+                                or _span_is_stutter(raw_words, raw_start, raw_end)):
             continue
         return False
     return True
