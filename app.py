@@ -92,8 +92,18 @@ DEFAULTS = {
     # cleanup
     "cleanup_enabled": True,
     "ollama_url": "http://localhost:11434",
-    "ollama_model": "flowlocal-cleanup",
+    # flowlocal-cleanup (llama3.2 3B) and -8b were pruned 2026-08-04 after
+    # benchmarking worst; defaulting to a model that no longer exists would
+    # fail every cleanup call on a config that omits this key.
+    "ollama_model": "flowlocal-cleanup-1b",
     "ollama_timeout_sec": 15,
+    "cleanup_skip_when_clean": True,
+    # Keep the cleanup model resident so the first dictation after an idle
+    # stretch doesn't pay Ollama's load cost. The heartbeat interval must stay
+    # comfortably under the TTL or the model unloads between beats.
+    "cleanup_pin_enabled": True,
+    "cleanup_pin_interval_sec": 30,
+    "cleanup_pin_ttl_sec": 60,
     # ask mode
     "rag_urls": [],
     "rag_k": 5,
@@ -524,6 +534,37 @@ def _fold_numbers(words):
     return out
 
 
+def _word_is_stutter_drop(raw_words, i, start, end) -> bool:
+    """True if raw_words[i] duplicates an adjacent copy that SURVIVES this
+    deletion (lies outside [start, end)). Requiring a surviving twin stops
+    'the the' collapsing to nothing."""
+    word = raw_words[i]
+    if i + 1 < len(raw_words) and raw_words[i + 1] == word and i + 1 >= end:
+        return True
+    if i - 1 >= 0 and raw_words[i - 1] == word and i - 1 < start:
+        return True
+    return False
+
+
+def _span_is_droppable(raw_words, start, end) -> bool:
+    """True if every word in a deleted run is individually droppable - filler
+    phrase or stutter repeat. SequenceMatcher merges adjacent deletions into a
+    single opcode, so a run like ['uh', 'the'] is neither wholly filler nor
+    wholly stutter and both whole-span predicates reject it. Walk it instead,
+    longest-filler-phrase first so 'you know' still matches as a unit."""
+    i = start
+    while i < end:
+        for n in range(min(_MAX_FILLER_WORDS, end - i), 0, -1):
+            if " ".join(raw_words[i:i + n]) in REMOVABLE_FILLERS:
+                i += n
+                break
+        else:
+            if not _word_is_stutter_drop(raw_words, i, start, end):
+                return False
+            i += 1
+    return True
+
+
 def is_cleanup_preserving(raw: str, cleaned: str) -> bool:
     """Allow punctuation, filler removal, and stutter removal - but never word
     substitutions, reordering, or additions."""
@@ -535,14 +576,77 @@ def is_cleanup_preserving(raw: str, cleaned: str) -> bool:
         if tag == "equal":
             continue
         if tag == "delete" and (_span_is_removable(raw_words[raw_start:raw_end])
-                                or _span_is_stutter(raw_words, raw_start, raw_end)):
+                                or _span_is_stutter(raw_words, raw_start, raw_end)
+                                or _span_is_droppable(raw_words, raw_start, raw_end)):
             continue
         return False
     return True
 
 
+_SPOKEN_PUNCT_CUES = ("comma", "period", "full stop", "question mark",
+                      "new line", "new paragraph", "exclamation")
+
+# A long stretch carrying no internal punctuation is where dictated commas go
+# missing. Generous on purpose - plenty of correct sentences are punctuation
+# free, and this only decides whether to spend one model call.
+_MAX_UNPUNCTUATED_RUN = 20
+
+
+def needs_cleaning(raw: str) -> bool:
+    """True when the text plausibly has something to clean.
+
+    Deliberately biased toward True: a false positive costs one model call,
+    a false negative silently ships uncleaned text. Already-clean text is
+    exactly where a small cleanup model does damage, because with nothing to
+    strip it starts answering the dictation instead of returning it.
+
+    Measured against dataset/ (35 real samples, 2026-08-05): 19 skipped, 16
+    sent to the model - filler 5, stutter 4, lowercase-start 5, long-run 1,
+    no-terminal-punct 1. The lowercase-start and long-run rules are what the
+    2026-08-05 widening added; together they recovered 6 samples that the
+    terminal-punctuation check alone had waved through uncleaned."""
+    if not raw or not raw.strip():
+        return False
+    words = re.findall(r"[a-z0-9]+", raw.lower())
+    if not words:
+        return False
+    # Filler phrases, longest first so 'you know' matches as a unit.
+    for i in range(len(words)):
+        for n in range(min(_MAX_FILLER_WORDS, len(words) - i), 0, -1):
+            if " ".join(words[i:i + n]) in REMOVABLE_FILLERS:
+                return True
+    # Stutter: an immediately repeated word.
+    if any(words[i] == words[i + 1] for i in range(len(words) - 1)):
+        return True
+    # Spoken punctuation commands still need converting to real marks.
+    joined = " ".join(words)
+    if any(cue in joined for cue in _SPOKEN_PUNCT_CUES):
+        return True
+    stripped = raw.strip()
+    # Anything reaching here has no fillers, no stutters and no spoken cues -
+    # the checks below are what is left to catch, and they are the reason the
+    # gate does not simply trust terminal punctuation.
+    #
+    # A lowercase sentence opening means Whisper never capitalized it.
+    first_alpha = next((c for c in stripped if c.isalpha()), "")
+    if first_alpha.islower():
+        return True
+    # A bare lowercase 'i' is always a capitalization miss.
+    if re.search(r"\bi\b", stripped):
+        return True
+    # A long unpunctuated run is almost always missing commas.
+    if any(len(run.split()) > _MAX_UNPUNCTUATED_RUN
+           for run in re.split(r"[,.;:!?\n]", stripped)):
+        return True
+    # No terminal punctuation is the usual sign Whisper left it raw.
+    return stripped[-1] not in ".!?"
+
+
 def cleanup(text: str) -> str:
     if not CFG["cleanup_enabled"] or not text:
+        return text
+    if CFG.get("cleanup_skip_when_clean", True) and not needs_cleaning(text):
+        log("cleanup skipped: nothing to clean")
         return text
     # Send the contract with every request so it remains authoritative even
     # when an older custom Ollama model has a stale baked-in system prompt.
@@ -571,6 +675,73 @@ def cleanup(text: str) -> str:
     return text
 
 
+# ---------------------------------------------------------------- model pin
+# Ollama evicts a model once its keep_alive TTL lapses, so the first dictation
+# after an idle stretch pays the load cost all over again. A heartbeat that
+# refreshes a rolling TTL keeps the cleanup model resident - cheap at 815 MB
+# for the 1B, deliberate at ~6 GB if the gemma quality tier is selected.
+#
+# Every FlowLocal exit path calls os._exit(0), which bypasses atexit, so the
+# release has to be wired into each of them by hand.
+_pin_stop = threading.Event()
+_pin_thread = None
+
+
+def _pin_request(keep_alive, timeout):
+    """Load or release the cleanup model. Posting no prompt makes Ollama apply
+    keep_alive without generating anything."""
+    r = requests.post(
+        f"{CFG['ollama_url']}/api/generate",
+        json={"model": CFG["ollama_model"], "keep_alive": keep_alive},
+        timeout=timeout,
+    )
+    r.raise_for_status()
+
+
+def _pin_heartbeat():
+    interval = CFG["cleanup_pin_interval_sec"]
+    ttl = f"{CFG['cleanup_pin_ttl_sec']}s"
+    announce = True
+    while not _pin_stop.is_set():
+        try:
+            _pin_request(ttl, CFG["ollama_timeout_sec"])
+            if announce:
+                log(f"cleanup model pinned: {CFG['ollama_model']} (ttl {ttl})")
+                announce = False
+        except Exception as e:
+            # Ollama down, or the model was never pulled. Keep beating rather
+            # than giving up - cleanup() already degrades to raw whisper, and
+            # Ollama usually comes back. Re-announce when it does.
+            log(f"cleanup pin heartbeat failed: {e}")
+            announce = True
+        _pin_stop.wait(interval)
+
+
+def start_model_pin():
+    if not (CFG["cleanup_enabled"] and CFG["cleanup_pin_enabled"]):
+        return
+    global _pin_thread
+    if _pin_thread is not None and _pin_thread.is_alive():
+        return
+    _pin_stop.clear()
+    _pin_thread = threading.Thread(target=_pin_heartbeat, daemon=True)
+    _pin_thread.start()
+
+
+def release_model_pin():
+    """Drop the cleanup model on quit so it stops holding VRAM once FlowLocal is
+    gone. Wired into every real exit path - but NOT into the duplicate-instance
+    guard, which must leave the already-running instance's model alone."""
+    _pin_stop.set()
+    if not (CFG["cleanup_enabled"] and CFG["cleanup_pin_enabled"]):
+        return
+    try:
+        _pin_request(0, 5)
+        log("cleanup model released")
+    except Exception as e:
+        log(f"cleanup model release failed: {e}")
+
+
 # ---------------------------------------------------------------- integrations
 def append_to_vault(text: str):
     """Opt-in: append transcript to Obsidian vault so personal-rag indexes it."""
@@ -587,9 +758,12 @@ def append_to_vault(text: str):
 
 
 def save_training_pair(audio: np.ndarray, raw_text: str):
-    """Opt-in: save wav + raw transcript pairs to dataset/ for future fine-tuning."""
+    """Opt-in: save wav + raw transcript pairs to dataset/ for future fine-tuning.
+
+    Returns the timestamp stamp so save_cleanup_pair() can file the cleaned
+    text against the same dictation, or None when saving is off or failed."""
     if not CFG.get("save_training_data") or not raw_text:
-        return
+        return None
     try:
         import wave
         ddir = Path(__file__).parent / "dataset"
@@ -602,8 +776,39 @@ def save_training_pair(audio: np.ndarray, raw_text: str):
             w.writeframes((np.clip(audio, -1, 1) * 32767).astype(np.int16).tobytes())
         (ddir / f"{ts}.txt").write_text(raw_text, encoding="utf-8")
         log(f"dataset: saved pair {ts}")
+        return ts
     except Exception as e:
         log(f"dataset save failed: {e}")
+        return None
+
+
+def save_cleanup_pair(stamp, raw_text: str, cleaned_text: str):
+    """Opt-in: record what cleanup actually did, as a real training pair.
+
+    The .txt written above is whisper's raw output - the INPUT half of a cleanup
+    pair. Until this existed the OUTPUT half only ever reached the Obsidian
+    vault, unlinked from its source, so `dataset/` could train ASR but never
+    cleanup. These files are the genuine article: real dictation, the real
+    model, the shipped guard's verdict. They beat anything a teacher model
+    generates after the fact, and they accumulate for free while you dictate.
+
+    `changed=false` rows matter as much as the rest - a cleanup model's hardest
+    lesson is returning already-clean text untouched."""
+    if not (CFG.get("save_training_data") and stamp) or not raw_text:
+        return
+    try:
+        ddir = Path(__file__).parent / "dataset"
+        rec = {
+            "raw": raw_text,
+            "cleaned": cleaned_text,
+            "model": CFG["ollama_model"],
+            "changed": cleaned_text.strip() != raw_text.strip(),
+            "gated_out": not needs_cleaning(raw_text),
+        }
+        (ddir / f"{stamp}.cleanup.json").write_text(
+            json.dumps(rec, ensure_ascii=False, indent=1), encoding="utf-8")
+    except Exception as e:
+        log(f"dataset cleanup-pair save failed: {e}")
 
 
 # ---------------------------------------------------------------- ask mode (personal-rag)
@@ -821,14 +1026,19 @@ def stop_and_process():
                 _emit("transcript", f"Q: {raw_text}\nA: {answer}")
                 log("pipeline: ask answered")
                 return
-            save_training_pair(audio, raw_text)
+            stamp = save_training_pair(audio, raw_text)
             text, should_submit = strip_submit_trigger(raw_text)
             if not text:
                 log("pipeline: submit trigger without dictation, skipped")
                 return
             t1 = time.time()
+            # Capture cleanup's input separately from the saved .txt - the wake
+            # or submit trigger has been stripped by here, and the pair has to
+            # reflect what the model was actually handed.
+            pre_cleanup = text
             text = cleanup(text)
             log(f"pipeline: cleanup done in {time.time()-t1:.1f}s -> {text!r}")
+            save_cleanup_pair(stamp, pre_cleanup, text)
             inject_text(text)
             log("pipeline: injected")
             if should_submit:
@@ -1009,6 +1219,7 @@ def setup_hotkeys():
         log(f"Ask (personal-rag): {CFG['ask_hotkey']}")
     threading.Thread(target=_hook_watchdog, daemon=True).start()
     log("hook watchdog armed")
+    start_model_pin()
     wake_listener.start()
 
 
@@ -1031,6 +1242,7 @@ def _make_icon(state):
 
 def _quit(icon, _item):
     icon.stop()
+    release_model_pin()
     os._exit(0)
 
 

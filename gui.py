@@ -509,6 +509,7 @@ class FlowGui:
             self.tray.stop()
         except Exception:
             pass
+        app.release_model_pin()  # os._exit below bypasses atexit
         import os
         os._exit(0)
 

@@ -5,6 +5,8 @@ __pycache__/
 
 # training data - personal voice recordings, never push
 dataset/
+# derived from dataset/, so it carries the same verbatim dictation
+dataset_cleanup/
 
 # anything transcription/audio related (belt and suspenders - app never writes these)
 *.wav
@@ -23,3 +25,5 @@ config.local.json
 
 # machine-specific settings (copy config.example.json -> config.json)
 config.json
+# dated rollback copies left behind by model/config experiments
+config.json.pre-*

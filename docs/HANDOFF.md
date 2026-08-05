@@ -1,7 +1,7 @@
 # FlowLocal — Session Handoff
 
 State of the project for any Claude Code / Cowork session picking this up.
-Repo: `wtcrowe4/FlowLocal` (public, MIT). Local: `D:\Claude\Projects\wisprflow-clone`.
+Repo: `wtcrowe4/FlowLocal` (public, MIT). Local: `D:\FlowLocal`.
 
 ## What it is
 
@@ -15,7 +15,9 @@ hotkey (keyboard raw hook)
   → sounddevice 16kHz mono capture (+350ms tail after key release)
   → faster-whisper distil-large-v3, CUDA fp16, beam 3, VAD pad 400ms,
     hotwords from vocab.txt
-  → optional Ollama cleanup (flowlocal-cleanup / flowlocal-cleanup-8b Modelfiles)
+  → needs_cleaning() gate, then optional Ollama cleanup (active model
+    flowlocal-cleanup-1b), output vetted by is_cleanup_preserving() —
+    on rejection the raw whisper text ships. See docs/CLEANUP-TUNING.md.
   → clipboard paste (old clipboard restored)
   → optional: append to Obsidian vault, save wav+txt training pair
 ```
@@ -31,11 +33,12 @@ POST to personal-rag `/query` → top chunks → local LLM answers → answer pa
 | `gui.py` | tkinter GUI: PIL-rendered skin, waveform overlay pill, settings, vocab editor. Main entry (`run.bat`). |
 | `config.json` | All settings. GUI writes it; hotkey/model changes need restart. |
 | `vocab.txt` | Whisper hotwords, auto-reloads on change. |
-| `Modelfile`, `Modelfile.8b` | Ollama cleanup model builds. |
+| `Modelfile`, `Modelfile.8b`, `Modelfile.gemma`, `Modelfile.1b` | Ollama cleanup model builds. **The 3B and 8B models were pruned 2026-08-04** (benchmarked worst, 30%/19%); recipes kept, bases still local, rebuild with `ollama create flowlocal-cleanup -f Modelfile`. Active model is `flowlocal-cleanup-1b`. See `docs/CLEANUP-TUNING.md`. |
 | `make_icon.py` | Renders icon.ico/png (512px blue mic). |
 | `create_shortcut.bat` | Icon + desktop shortcut (pythonw target). |
 | `setup_autostart.bat` / `FlowLocal.vbs` / `stop.bat` | Startup / silent launch / kill (game-mode script calls stop.bat). |
-| `dataset/` | Opt-in wav+txt pairs for fine-tuning. GITIGNORED — personal voice data, never push. |
+| `dataset/` | Opt-in training data, GITIGNORED (personal voice data, never push). `{ts}.wav` + `{ts}.txt` are the ASR pair; `{ts}.cleanup.json` (added 2026-08-05) is the *cleanup* pair — what the model was handed and what it returned. |
+| `tools/build_cleanup_corpus.py` | Bootstraps a raw/cleaned corpus for a cleanup fine-tune by running the 7.5B gemma teacher over `dataset/*.txt` and keeping only guard-accepted pairs. Writes gitignored `dataset_cleanup/corpus.jsonl`. |
 
 ## personal-rag endpoint (ask mode)
 
@@ -83,14 +86,14 @@ POST to personal-rag `/query` → top chunks → local LLM answers → answer pa
 
 ## Roadmap
 
-0. **TTS readback** (next up) — see `docs/PLAN-tts-readback.md`. Claude Code Stop
-   hook + kokoro-onnx daemon, native Windows. Solves Thomas's actual bottleneck
-   (slow reading of Claude responses). Notably does NOT require changing this
-   repo — FlowLocal is already the input half. herdr is an optional helper for
-   focus-gating and "agent blocked" cues, not a dependency. That plan also
-   documents corrections to the original Downloads plans (wrong kokoro package,
-   unnecessary WSL) and notes that **ask mode at `app.py:418` is already the
-   Plan 3 "core loop" minus a `speak()` call**.
+0. ~~**TTS readback**~~ — **SHIPPED.** Built as its own project rather than in
+   this repo: `wtcrowe4/tts-daemon`, a Kokoro FastAPI daemon on
+   `localhost:8123` (WSL `~/llm/tts-daemon`, default voice `bf_emma`, premium
+   engine Chatterbox Turbo). It speaks Claude Code responses via a Stop hook
+   (opt-in, `cca-tts` sets `CLAUDE_TTS=1`) and FlowLocal's ask-mode answers.
+   FlowLocal's half is the `tts_enabled` / `tts_url` / `tts_max_chars` /
+   `tts_timeout_sec` config keys and the `tts_speak()` call in ask mode.
+   Original design notes remain in `docs/PLAN-tts-readback.md` for history.
 1. **pywebview UI port** — Thomas is designing in Claude; port design as HTML/CSS over existing engine events (`app.on_event("state"|"transcript")`).
 2. **whisper-lab** (separate repo/session) — Modal-based model eval + fine-tune. See `docs/whisper-lab-brief.md`.
 3. Vault ingest automation lives in personal-rag (cron `--changed-only`).

@@ -262,6 +262,10 @@ def _hard_exit():
         keyboard.unhook_all()
     except Exception:
         pass
+    # os._exit bypasses atexit, so the Ollama model has to be released here.
+    # Deliberately absent from _single_instance()'s exit - that path must not
+    # unload the model out from under the instance that is already running.
+    app.release_model_pin()
     os._exit(0)
 
 
