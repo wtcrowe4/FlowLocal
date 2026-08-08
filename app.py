@@ -109,6 +109,17 @@ DEFAULTS = {
     # ordinary room tone sits near 0.001, speech at 0.008-0.015. 0.0001 is an
     # order of magnitude clear of both floors.
     "mic_silence_rms": 0.0001,
+    # Beep length. Must outlast the output device's wake-from-idle latency or
+    # the tone is swallowed whole: an idle endpoint - especially a wireless
+    # headset - spends the first fraction of a second powering up. That is why
+    # the first beep after a pause was never heard while a second beep fired
+    # straight after always was, and why it made no difference which audio API
+    # played it. 250ms clears typical wake latency with the tone still short.
+    "beep_ms": 250,
+    # Seconds the mic stays open after the key is released. The last word is
+    # still being finished as the user lets go, so stopping immediately clips
+    # it. Raise if dictation is losing its tail.
+    "tail_capture_sec": 0.5,
     "cleanup_pin_enabled": True,
     "cleanup_pin_interval_sec": 30,
     "cleanup_pin_ttl_sec": 60,
@@ -983,18 +994,27 @@ def has_submit_trigger(text: str) -> bool:
 def beep(kind: str):
     """Feedback tone.
 
-    Deliberately winsound.Beep. A sounddevice rewrite was tried and reverted:
-    it played cleanly - correct device index, full 120ms duration, no error -
-    and was completely inaudible on this machine, while winsound.Beep does
-    reach the speakers. PortAudio's default output index is not necessarily
-    where the user is actually listening; winsound follows the system path.
-    The audible route wins over the tidier API.
+    UNSOLVED: the first beep after an idle pause is not heard; a second one
+    fired straight after always is. Ruled out so far - it is not the API
+    (winsound.Beep and a sounddevice tone fail identically), not the tone
+    length (120ms and 250ms both fail), not a start-vs-stop race, not the
+    Windows power plan, not USB selective suspend, and not per-device
+    power-save (all disabled, 22 devices, no change). A 37Hz wake pulse 60ms
+    ahead of the tone did not help either.
+
+    A permanently-open sounddevice keep-alive stream was tried to stop the
+    endpoint idling: it did not fix the beep and coincided with dictation
+    being clipped, so it was reverted rather than left in on a hunch.
+
+    Next thing to establish is which physical output actually reaches the
+    user's ears - that was never determined, and everything above assumed it.
     """
     if not CFG["beep_feedback"]:
         return
     freq = {"start": 880, "stop": 660, "error": 220}.get(kind, 440)
+    ms = max(1, int(CFG.get("beep_ms", 250)))
     threading.Thread(
-        target=lambda: winsound.Beep(freq, 120), daemon=True
+        target=lambda: winsound.Beep(freq, ms), daemon=True
     ).start()
 
 
@@ -1065,7 +1085,7 @@ def stop_and_process():
         try:
             # tail capture: user releases the key while still finishing the last
             # word - keep the mic open a beat so it isn't clipped
-            time.sleep(0.35)
+            time.sleep(float(CFG.get("tail_capture_sec", 0.5)))
             audio, duration = recorder.stop()
             log(f"pipeline: {duration:.1f}s audio, {audio.size} samples")
             if duration < CFG["min_recording_sec"] or audio.size == 0:
@@ -1078,11 +1098,15 @@ def stop_and_process():
             # Say so out loud instead, and skip the pointless Whisper pass.
             rms = float(np.sqrt(np.mean(np.square(audio))))
             if rms < CFG.get("mic_silence_rms", 0.0001):
-                log(f"pipeline: mic returned near-silence (rms={rms:.6f}, "
-                    f"{duration:.1f}s) - if you spoke, the mic is dead; "
-                    f"power-cycle the headset")
-                beep("error")
-                return
+                # Warn but keep going. A dead mic costs nothing here - Whisper
+                # returns '' from zeros in 0.0s - whereas returning early would
+                # throw away real dictation whenever this misfires, and it does
+                # misfire: a live headset mic in a quiet room measured 0.000059
+                # against a confirmed-dead 0.000015. Diagnosing must never cost
+                # the user a transcript.
+                log(f"pipeline: mic near-silent (rms={rms:.6f}, {duration:.1f}s)"
+                    f" - if you spoke and nothing appears, the mic has gated "
+                    f"off; power-cycle the headset")
             t0 = time.time()
             raw_text = transcribe(audio)
             log(f"pipeline: whisper done in {time.time()-t0:.1f}s -> {raw_text!r}")
