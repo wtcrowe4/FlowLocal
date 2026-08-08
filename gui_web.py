@@ -48,11 +48,28 @@ class MonitorInfo(ctypes.Structure):
 
 def _single_instance():
     """Refuse to start twice - prevents duplicate pills after a restart
-    where the old process never died."""
+    where the old process never died.
+
+    A second launch is a request to SEE FlowLocal, though, so surface the
+    running instance's HUD before exiting. Silently exiting made a hidden HUD
+    unreachable: Api.hide() leaves the process alive holding this mutex, so
+    every relaunch died here with only a log line, and the tray icon was the one
+    way back in. Losing the tray icon meant the app looked dead while running.
+
+    Still no release_model_pin() here - see docs/CLEANUP-TUNING.md. This exit
+    belongs to the duplicate, and must not unload the live instance's model."""
     k32 = ctypes.windll.kernel32
     k32.CreateMutexW(None, False, "FlowLocal_SingleInstance")
     if k32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
-        app.log("FlowLocal already running - duplicate exiting (use stop.bat first)")
+        u32 = ctypes.windll.user32
+        hwnd = u32.FindWindowW(None, "FlowLocal")  # HUD; pill is "FlowLocal Pill"
+        if hwnd:
+            u32.ShowWindow(hwnd, 9)  # SW_RESTORE - unhides AND un-minimizes
+            u32.SetForegroundWindow(hwnd)
+            app.log("FlowLocal already running - surfaced the existing HUD")
+        else:
+            app.log("FlowLocal already running - duplicate exiting "
+                    "(HUD window not found; use stop.bat first)")
         os._exit(0)
 
 

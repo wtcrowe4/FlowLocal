@@ -195,6 +195,34 @@ def get_state():
 
 
 # ---------------------------------------------------------------- audio
+def _resolve_input_device():
+    """Index of the configured input mic, or None to accept PortAudio's default.
+
+    Pinned by NAME, never by index. Indices renumber whenever Windows gains or
+    loses an audio endpoint - switching output to the monitor speakers is
+    enough - and PortAudio caches its device table at import (see the retry in
+    Recorder.start). A stale index is the dangerous case: it opens without
+    error and records digital silence, so nothing raises and no handler fires.
+    Whisper then returns '' from a full-length buffer and the dictation is
+    simply lost. Matching on the device name survives all of that.
+    """
+    want = str(CFG.get("device", "auto") or "auto").strip()
+    if want.lower() in ("auto", "default", ""):
+        return None
+    for attempt in (0, 1):
+        for i, dev in enumerate(sd.query_devices()):
+            if dev["max_input_channels"] > 0 and want.lower() in dev["name"].lower():
+                return i
+        if attempt == 0:
+            # Not in the cached table - the mic may have been asleep or absent
+            # when PortAudio enumerated at import. Re-enumerate once, then look
+            # again before giving up.
+            sd._terminate()
+            sd._initialize()
+    log(f"input device {want!r} not found - falling back to system default")
+    return None
+
+
 class Recorder:
     def __init__(self):
         self._chunks = []
@@ -214,6 +242,7 @@ class Recorder:
             samplerate=SAMPLE_RATE,
             channels=1,
             dtype="float32",
+            device=_resolve_input_device(),
             callback=self._callback,
         )
         self._stream.start()
@@ -291,6 +320,7 @@ class WakeListener:
         try:
             self._stream = sd.InputStream(
                 samplerate=SAMPLE_RATE, channels=1, dtype="float32",
+                device=_resolve_input_device(),
                 callback=self._callback,
             )
             self._stream.start()
@@ -1055,6 +1085,27 @@ def stop_and_process():
         finally:
             set_state(State.IDLE)
             wake_listener.start()
+            # This pipeline just held the GIL for seconds - a Whisper pass, then
+            # an Ollama cleanup that can sit on its full timeout - so our
+            # (Python) hook callback could not run inside the ~300ms
+            # LowLevelHooksTimeout and Windows will have evicted the keyboard
+            # hook. That kills F24 and right-ctrl silently: dictate once, and the
+            # hotkeys are dead until the watchdog notices up to a minute later.
+            # Reinstall here, where the heavy work actually ends.
+            #
+            # This is the one place that covers every recording - hotkey, wake
+            # trigger, or HUD button - because they all funnel through _work().
+            # Doing it in _hotkey_worker instead fired too early: stop_and_process
+            # only spawns this thread and returns, so the reinstall landed before
+            # the eviction rather than after it.
+            #
+            # Skip while a hold is down: unhook_all() would drop the pending
+            # release and wedge _hold_down True. The watchdog covers that case.
+            if not _hold_down:
+                try:
+                    _install_key_hooks()
+                except Exception as e:
+                    log(f"hook reinstall failed: {type(e).__name__}: {e}")
 
     threading.Thread(target=_work, daemon=True).start()
 
@@ -1142,19 +1193,6 @@ def _note_hook_event(_e=None):
     _last_hook_event = time.time()
 
 
-class _LASTINPUTINFO(ctypes.Structure):
-    _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
-
-
-def _system_idle_sec() -> float:
-    """Seconds since Windows last saw any real user input, hook or not."""
-    info = _LASTINPUTINFO()
-    info.cbSize = ctypes.sizeof(info)
-    if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(info)):
-        return 0.0
-    return max(0.0, (ctypes.windll.kernel32.GetTickCount() - info.dwTime) / 1000.0)
-
-
 def _install_key_hooks():
     """(Re)install every keyboard hook. Safe to call repeatedly - the watchdog
     calls it to recover a hook Windows threw away."""
@@ -1174,12 +1212,50 @@ def _install_key_hooks():
                 _on_hold_release(e)
 
         keyboard.hook(_hold_hook)
+    # Everything below is a raw hook, deliberately - NOT add_hotkey.
+    # add_hotkey registrations do not survive keyboard.unhook_all() and
+    # re-registering: the raw hooks come back, the hotkeys silently do not. So
+    # every refresh of these hooks permanently killed the toggle until the
+    # process restarted, while raw-hook keys like right ctrl kept working. That
+    # is the whole reason F24 - and the middle click mapped to it - kept
+    # "detaching" while hold-to-talk stayed rock solid.
     tog = CFG["toggle_hotkey"]
     if tog:
-        keyboard.add_hotkey(tog, _on_toggle)
+        tog_down = [False]  # list, not a bool: closure needs to mutate it
+
+        def _toggle_hook(e):
+            if e.name != tog:
+                return
+            if e.event_type == "down":
+                if tog_down[0]:  # key auto-repeat while held
+                    return
+                tog_down[0] = True
+                _on_toggle()
+            elif e.event_type == "up":
+                tog_down[0] = False
+
+        keyboard.hook(_toggle_hook)
     ask = CFG.get("ask_hotkey")
     if ask:
-        keyboard.add_hotkey(ask, _on_ask_toggle)
+        # "ctrl+alt+space" -> modifiers checked live, main key drives the edge.
+        _parts = [p.strip() for p in ask.split("+") if p.strip()]
+        ask_main, ask_mods = _parts[-1], _parts[:-1]
+        ask_down = [False]
+
+        def _ask_hook(e):
+            if e.name != ask_main:
+                return
+            if e.event_type == "down":
+                if ask_down[0]:
+                    return
+                if not all(keyboard.is_pressed(m) for m in ask_mods):
+                    return
+                ask_down[0] = True
+                _on_ask_toggle()
+            elif e.event_type == "up":
+                ask_down[0] = False
+
+        keyboard.hook(_ask_hook)
     _note_hook_event()
 
 
@@ -1190,18 +1266,34 @@ def _hook_watchdog():
     hotkey simply stops working until restart. This is how the F24 toggle kept
     "detaching".
 
-    There is no API to ask whether our hook is still installed, so infer it:
-    if Windows says the user is actively typing/clicking but our hook has seen
-    nothing for a while, the hook is gone. Reinstall it."""
+    This is now only a backstop - _hotkey_worker reinstalls as soon as the
+    pipeline that trips the eviction finishes, which covers the common case.
+
+    There is no API to ask whether our hook is still installed, and the old
+    "user active but our hook is silent" inference was wrong in both directions.
+    GetLastInputInfo cannot tell keyboard input from mouse input, so ordinary
+    mouse-only work looked identical to a dead hook: it fired every 90s all day,
+    thousands of log lines that trimmed the log's own history away. And it was
+    too slow for real evictions, leaving hotkeys dead for up to two minutes.
+
+    Reinstalling is idempotent and costs microseconds, so stop trying to detect
+    the eviction and just refresh on a cadence when our hook has gone quiet.
+    Log rarely - a false positive is now harmless, but noise is not."""
+    last_log = 0.0
     while True:
         time.sleep(30)
         try:
-            active = _system_idle_sec() < 25
+            # Never swap hooks mid-recording or mid-hold - unhook_all() would
+            # drop the pending release event and wedge _hold_down True.
+            if get_state() != State.IDLE or _hold_down:
+                continue
             silent_for = time.time() - _last_hook_event
-            if active and silent_for > 90:
-                log(f"keyboard hook evicted (no events in {silent_for:.0f}s "
-                    f"while user active) - reinstalling")
-                _install_key_hooks()
+            if silent_for <= 60:
+                continue
+            _install_key_hooks()
+            if time.time() - last_log > 600:
+                log(f"hooks refreshed (no keyboard events in {silent_for:.0f}s)")
+                last_log = time.time()
         except Exception as e:
             log(f"hook watchdog error: {type(e).__name__}: {e}")
 
