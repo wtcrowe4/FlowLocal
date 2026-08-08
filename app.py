@@ -104,6 +104,11 @@ DEFAULTS = {
     # Audio capture mic, matched by name substring. Distinct from "device"
     # above, which is Whisper's compute device (auto/cuda/cpu).
     "input_device": "auto",
+    # Below this RMS the capture is treated as a dead mic, not as silence.
+    # Measured on this hardware: a gated-off wireless headset reads 0.000015,
+    # ordinary room tone sits near 0.001, speech at 0.008-0.015. 0.0001 is an
+    # order of magnitude clear of both floors.
+    "mic_silence_rms": 0.0001,
     "cleanup_pin_enabled": True,
     "cleanup_pin_interval_sec": 30,
     "cleanup_pin_ttl_sec": 60,
@@ -976,6 +981,15 @@ def has_submit_trigger(text: str) -> bool:
 
 # ---------------------------------------------------------------- feedback
 def beep(kind: str):
+    """Feedback tone.
+
+    Deliberately winsound.Beep. A sounddevice rewrite was tried and reverted:
+    it played cleanly - correct device index, full 120ms duration, no error -
+    and was completely inaudible on this machine, while winsound.Beep does
+    reach the speakers. PortAudio's default output index is not necessarily
+    where the user is actually listening; winsound follows the system path.
+    The audible route wins over the tidier API.
+    """
     if not CFG["beep_feedback"]:
         return
     freq = {"start": 880, "stop": 660, "error": 220}.get(kind, 440)
@@ -1015,9 +1029,16 @@ def start_recording(mode=None):
         _rec_mode = "dictate"
     wake_listener.stop()
     set_state(State.RECORDING)
-    beep("start")
     try:
         recorder.start()
+        # Beep AFTER the mic is open, never before. Opening the input stream
+        # churns PortAudio's device setup, and the start tone was being cut
+        # while its output stream was still initialising - which is exactly why
+        # the stop beep (which races nothing, the pipeline sleeps 0.35s first)
+        # always played and the start beep did not. Beeping here also means the
+        # tone only fires once recording genuinely began; a mic failure now
+        # gets the error beep instead of a misleading start beep.
+        beep("start")
         log("recording started")
         if (_rec_mode == "dictate" and CFG.get("voice_submit_trigger_enabled", True)):
             _voice_submit_stop = threading.Event()
@@ -1049,6 +1070,18 @@ def stop_and_process():
             log(f"pipeline: {duration:.1f}s audio, {audio.size} samples")
             if duration < CFG["min_recording_sec"] or audio.size == 0:
                 log("pipeline: too short, skipped")
+                return
+            # A gated-off wireless headset still opens, still fills the buffer,
+            # and still reports the right duration - it just delivers zeros.
+            # Whisper's VAD then returns '' in 0.0s and the dictation vanishes
+            # with no clue why, which is indistinguishable from "said nothing".
+            # Say so out loud instead, and skip the pointless Whisper pass.
+            rms = float(np.sqrt(np.mean(np.square(audio))))
+            if rms < CFG.get("mic_silence_rms", 0.0001):
+                log(f"pipeline: mic returned near-silence (rms={rms:.6f}, "
+                    f"{duration:.1f}s) - if you spoke, the mic is dead; "
+                    f"power-cycle the headset")
+                beep("error")
                 return
             t0 = time.time()
             raw_text = transcribe(audio)

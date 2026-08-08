@@ -27,3 +27,6 @@ config.local.json
 config.json
 # dated rollback copies left behind by model/config experiments
 config.json.pre-*
+
+# Claude Code local overrides (machine-specific)
+.claude/settings.local.json
