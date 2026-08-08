@@ -101,6 +101,9 @@ DEFAULTS = {
     # Keep the cleanup model resident so the first dictation after an idle
     # stretch doesn't pay Ollama's load cost. The heartbeat interval must stay
     # comfortably under the TTL or the model unloads between beats.
+    # Audio capture mic, matched by name substring. Distinct from "device"
+    # above, which is Whisper's compute device (auto/cuda/cpu).
+    "input_device": "auto",
     "cleanup_pin_enabled": True,
     "cleanup_pin_interval_sec": 30,
     "cleanup_pin_ttl_sec": 60,
@@ -206,7 +209,10 @@ def _resolve_input_device():
     Whisper then returns '' from a full-length buffer and the dictation is
     simply lost. Matching on the device name survives all of that.
     """
-    want = str(CFG.get("device", "auto") or "auto").strip()
+    # NOTE: "input_device", NOT "device". CFG["device"] is faster-whisper's
+    # compute device (auto/cuda/cpu) - overloading it silently drops Whisper to
+    # CPU int8 and turns a 0.1s transcription into 10s.
+    want = str(CFG.get("input_device", "auto") or "auto").strip()
     if want.lower() in ("auto", "default", ""):
         return None
     for attempt in (0, 1):
