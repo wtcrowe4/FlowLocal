@@ -172,6 +172,12 @@ body {
       <div class="cfgrow"><span class="k">INPUT.MODE</span><button class="mode" id="cfgMode" onclick="flipMode()">DICTATE</button></div>
       <div class="cfgrow"><span class="k">AI.CLEANUP</span><span class="tog" id="cfgCleanup" onclick="flip('cfgCleanup')">[ ON ]</span></div>
       <div class="cfgrow"><span class="k">OLLAMA.MODEL</span><select id="cfgOllama"></select></div>
+      <div class="cfgrow"><span class="k">SOUND.START</span><select id="cfgSndStart" onchange="pickSound('start',this.value)"></select></div>
+      <div class="cfgrow"><span class="k">SOUND.STOP</span><select id="cfgSndStop" onchange="pickSound('stop',this.value)"></select></div>
+      <div class="cfgrow"><span class="k">SOUND.ERROR</span><select id="cfgSndError" onchange="pickSound('error',this.value)"></select></div>
+      <div class="cfgrow"><span class="k">SOUND.ASK</span><select id="cfgSndAsk" onchange="pickSound('ask',this.value)"></select></div>
+      <div class="cfgrow"><span class="k">SOUND.MIC.DEAD</span><select id="cfgSndMicdead" onchange="pickSound('micdead',this.value)"></select></div>
+      <div class="cfgrow"><span class="k">SOUND.SUBMIT</span><select id="cfgSndSubmit" onchange="pickSound('submit',this.value)"></select></div>
       <div class="cfgrow"><span class="k">VAULT.LOG</span><span class="tog" id="cfgVault" onclick="flip('cfgVault')">[ OFF ]</span></div>
       <div class="cfgrow"><span class="k">TRAIN.DATA</span><span class="tog" id="cfgTrain" onclick="flip('cfgTrain')">[ OFF ]</span></div>
     </div>
@@ -217,6 +223,13 @@ window.addEventListener('pywebviewready', async () => {
   let om = init.ollama_models || [];
   if (!om.includes(CFG.ollama_model)) om = [CFG.ollama_model, ...om];
   $('cfgOllama').innerHTML = om.map(m => `<option ${m===CFG.ollama_model?'selected':''}>${m}</option>`).join('');
+  // beep sound dropdowns: every *.wav in sounds/, saved + previewed on change
+  const snd = init.beep_sounds || [];
+  for (const [kind, el] of [['start','cfgSndStart'],['stop','cfgSndStop'],['error','cfgSndError'],
+                            ['ask','cfgSndAsk'],['micdead','cfgSndMicdead'],['submit','cfgSndSubmit']]) {
+    const cur = CFG['beep_sound_' + kind];
+    $(el).innerHTML = snd.map(s => `<option ${s===cur?'selected':''}>${s}</option>`).join('');
+  }
   setTog('cfgCleanup', CFG.cleanup_enabled); setTog('cfgVault', CFG.vault_append_enabled);
   setTog('cfgTrain', CFG.save_training_data);
   $('vocabText').value = init.vocab;
@@ -225,6 +238,11 @@ window.addEventListener('pywebviewready', async () => {
     `<span>[${CFG.toggle_hotkey.toUpperCase()}] TOGGLE</span>` +
     (CFG.ask_hotkey ? `<span>[${CFG.ask_hotkey.toUpperCase()}] ASK.RAG</span>` : '');
 });
+
+async function pickSound(kind, name) {
+  CFG['beep_sound_' + kind] = name;
+  await api('set_beep_sound', kind, name);  // persists and previews server-side
+}
 
 // ---------------- engine events (called from python) ----------------
 function onReady() { ready = true; $('startBtn').disabled = false; onState('idle'); }

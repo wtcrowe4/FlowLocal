@@ -10,6 +10,10 @@ dataset_cleanup/
 
 # anything transcription/audio related (belt and suspenders - app never writes these)
 *.wav
+# ...except the CC0 UI feedback chimes, which are not dictation audio
+!sounds/*.wav
+# runtime-padded copies, rebuilt on demand
+sounds/_cache/
 *.mp3
 *.flac
 transcripts/

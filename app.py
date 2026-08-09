@@ -109,13 +109,43 @@ DEFAULTS = {
     # ordinary room tone sits near 0.001, speech at 0.008-0.015. 0.0001 is an
     # order of magnitude clear of both floors.
     "mic_silence_rms": 0.0001,
-    # Beep length. Must outlast the output device's wake-from-idle latency or
-    # the tone is swallowed whole: an idle endpoint - especially a wireless
-    # headset - spends the first fraction of a second powering up. That is why
-    # the first beep after a pause was never heard while a second beep fired
-    # straight after always was, and why it made no difference which audio API
-    # played it. 250ms clears typical wake latency with the tone still short.
+    # Beep length. The tone no longer has to outlast device wake-up on its
+    # own - beep_wake_lead_ms below covers that - so this is purely how long
+    # the tone sounds.
     "beep_ms": 250,
+    # Hold the output sink awake with an endless silent stream so beeps
+    # play instantly. Without it an idle sink (monitor HDMI audio, wireless
+    # headset RF link) powers down and swallows the first second or so of
+    # anything played. Costs one silent 48kHz mono stream of CPU (~nothing)
+    # and keeps a wireless headset's link up if one is the output - turn
+    # off there if battery matters more than the first beep.
+    "output_keepalive": True,
+    # Fallback when the keep-alive is disabled or failed: silence baked
+    # ahead of each sound so the audible part lands on an awake sink. Even
+    # 1000ms was not always enough for the Odyssey G95SC over NVIDIA HDMI,
+    # and it makes every beep feel laggy - hence the keep-alive above.
+    # Ignored (0 lead) while the keep-alive stream is running.
+    "beep_wake_lead_ms": 1000,
+    # Which file from sounds/ plays for each event. Any *.wav dropped into
+    # that folder shows up in the HUD dropdowns automatically.
+    "beep_sound_start": "maximize_008.wav",
+    "beep_sound_stop": "minimize_008.wav",
+    "beep_sound_error": "error_008.wav",
+    # ask-mode recording start - distinct from dictate so the mode is
+    # audible without looking at the pill
+    "beep_sound_ask": "question_001.wav",
+    # the mic gated off mid-capture (the wireless headset failure mode) -
+    # deliberately harsh: it means "power-cycle the headset"
+    "beep_sound_micdead": "glitch_001.wav",
+    # the voice submit phrase was heard - replaces the stop sound for that
+    # stop so the two never overlap
+    "beep_sound_submit": "confirmation_001.wav",
+    # Beep output, matched by name substring like input_device. "auto" means
+    # the system default output - here the monitor over NVIDIA HDMI, which is
+    # where the user normally listens (headset is worn only sometimes; its
+    # mic is used regardless). Pin to e.g. "AWPRO H Wireless Game" to route
+    # feedback to the headset instead.
+    "output_device": "auto",
     # Seconds the mic stays open after the key is released. The last word is
     # still being finished as the user lets go, so stopping immediately clips
     # it. Raise if dictation is losing its tail.
@@ -239,8 +269,7 @@ def _resolve_input_device():
             # Not in the cached table - the mic may have been asleep or absent
             # when PortAudio enumerated at import. Re-enumerate once, then look
             # again before giving up.
-            sd._terminate()
-            sd._initialize()
+            _reset_portaudio()
     log(f"input device {want!r} not found - falling back to system default")
     return None
 
@@ -281,8 +310,7 @@ class Recorder:
             # fails with "Error querying device -1" forever. Re-enumerate and retry
             # so the mic recovers on the next keypress instead of needing a restart.
             log(f"Mic open failed ({e}); re-enumerating PortAudio and retrying")
-            sd._terminate()
-            sd._initialize()
+            _reset_portaudio()
             self._open()
 
     def stop(self):
@@ -991,31 +1019,235 @@ def has_submit_trigger(text: str) -> bool:
 
 
 # ---------------------------------------------------------------- feedback
+_beep_lock = threading.Lock()
+
+
+def _resolve_output_device():
+    """Beep output index by name substring, or None for system default.
+
+    Mirrors _resolve_input_device. Prefers the WASAPI entry when a device
+    appears under several host APIs: MME truncates names to 31 chars (so a
+    full-name substring can miss it entirely) and adds the most latency.
+    """
+    want = str(CFG.get("output_device", "auto") or "auto").strip()
+    if want.lower() in ("auto", "default", ""):
+        return None
+    matches = [
+        (i, dev)
+        for i, dev in enumerate(sd.query_devices())
+        if dev["max_output_channels"] > 0 and want.lower() in dev["name"].lower()
+    ]
+    for i, dev in matches:
+        if "wasapi" in sd.query_hostapis(dev["hostapi"])["name"].lower():
+            return i
+    if matches:
+        return matches[0][0]
+    log(f"output device {want!r} not found - using system default")
+    return None
+
+
+def _render_beep(freq: int, ms: int):
+    """Play lead-in silence + tone as ONE continuous output stream.
+
+    Root cause of the historical first-beep failure: the wireless headset
+    sink powers down after idle and takes far longer than the tone itself to
+    wake, so the entire first tone rendered after a pause fell inside the
+    wake window - which is also why an immediate second beep always played,
+    and why API choice, tone length up to 250ms, Windows power plans, USB
+    suspend, and per-device power-save all made no difference. A 37Hz pulse
+    60ms ahead failed for the same reason: 60ms of lead is far below
+    wireless wake latency, and it played as a separate render session.
+
+    The silence here is not a gap before playback - it is actively rendered
+    audio that opens the stream and starts the sink waking, so the tone
+    arrives on an awake device. A permanent keep-alive stream would also
+    work but drains the headset battery and previously coincided with
+    dictation clipping, so it stays out.
+    """
+    sr = 48000
+    lead_ms = 0 if _keepalive_active() else max(
+        0, int(CFG.get("beep_wake_lead_ms", 1000))
+    )
+    t = np.arange(int(sr * ms / 1000)) / sr
+    tone = 0.4 * np.sin(2 * np.pi * freq * t)
+    fade = min(int(sr * 0.005), tone.size // 2)
+    if fade:
+        tone[:fade] *= np.linspace(0.0, 1.0, fade)
+        tone[-fade:] *= np.linspace(1.0, 0.0, fade)
+    buf = np.concatenate(
+        [np.zeros(int(sr * lead_ms / 1000)), tone]
+    ).astype(np.float32)
+    with _beep_lock:  # overlapping beeps would fight for the output device
+        sd.play(buf, sr, blocking=True, device=_resolve_output_device())
+
+
+# ---------------------------------------------------------------- output keep-alive
+_keepalive_stream = None
+_keepalive_lock = threading.Lock()
+
+
+def _keepalive_active():
+    s = _keepalive_stream
+    return bool(s is not None and s.active)
+
+
+def start_output_keepalive():
+    """Hold the output sink awake with an endless silent stream.
+
+    The monitor's HDMI audio powers down after idle and takes over a second
+    to wake, swallowing whatever plays meanwhile. Baked lead-in silence was
+    a bad trade: 1000ms still missed the first beep after long idle, yet
+    made every beep feel laggy. With the sink held awake, beeps play
+    instantly and the lead is skipped entirely.
+
+    The old keep-alive experiment's 'dictation clipping' had a concrete
+    mechanism: sd._terminate() ran with the stream open, corrupting live
+    PortAudio state. All re-enumeration now goes through _reset_portaudio(),
+    which closes this stream first and reopens it after.
+    """
+    if not CFG.get("output_keepalive", True):
+        return
+
+    def _run():
+        global _keepalive_stream
+        # PortAudio needs COM on the opening thread (see beep()); park here
+        # afterwards so the COM apartment outlives the stream.
+        ctypes.windll.ole32.CoInitializeEx(None, 0)
+        try:
+            with _keepalive_lock:
+                if _keepalive_stream is not None:
+                    return
+                s = sd.OutputStream(
+                    samplerate=48000, channels=1, dtype="float32",
+                    device=_resolve_output_device(),
+                    blocksize=4800,  # 100ms of zeros per callback - negligible CPU
+                    callback=lambda out, *_: out.fill(0),
+                )
+                s.start()
+                _keepalive_stream = s
+            log("output keep-alive up - sink held awake, beeps need no lead")
+            while _keepalive_stream is s:
+                time.sleep(1.0)
+        except Exception as e:
+            log(f"output keep-alive failed ({e}) - beeps fall back to wake lead")
+        finally:
+            ctypes.windll.ole32.CoUninitialize()
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def stop_output_keepalive():
+    global _keepalive_stream
+    with _keepalive_lock:
+        s, _keepalive_stream = _keepalive_stream, None
+    if s is not None:
+        try:
+            s.abort()
+            s.close()
+        except Exception:
+            pass
+
+
+def _reset_portaudio():
+    """Re-enumerate PortAudio's device table without corrupting live streams.
+
+    Terminating PortAudio while any stream is open is undefined behavior -
+    it is what clipped dictation during the old keep-alive experiment. Close
+    the keep-alive first, re-init, then bring it back.
+    """
+    stop_output_keepalive()
+    sd._terminate()
+    sd._initialize()
+    start_output_keepalive()
+
+
+SOUNDS_DIR = Path(__file__).parent / "sounds"
+_prepared_beeps = {}  # (src name, lead_ms, src mtime) -> padded wav path
+
+
+def list_beep_sounds():
+    """Filenames of every selectable sound - anything *.wav in sounds/."""
+    if not SOUNDS_DIR.is_dir():
+        return []
+    return sorted(p.name for p in SOUNDS_DIR.glob("*.wav"))
+
+
+def _prepared_beep(kind: str):
+    """Padded WAV path for the configured beep_sound_<kind>, or None.
+
+    The wake-lead silence is baked into a copy under sounds/_cache,
+    rebuilt whenever the source file or beep_wake_lead_ms changes, so a
+    dropdown change or a swapped file just works on the next beep.
+    """
+    name = str(CFG.get(f"beep_sound_{kind}", "") or f"{kind}.wav")
+    src = SOUNDS_DIR / name
+    if not src.exists():
+        return None
+    # keep-alive holds the sink awake, so no wake lead is needed
+    lead_ms = 0 if _keepalive_active() else max(
+        0, int(CFG.get("beep_wake_lead_ms", 1000))
+    )
+    key = (src.name, lead_ms, src.stat().st_mtime)
+    cached = _prepared_beeps.get(key)
+    if cached and Path(cached).exists():
+        return cached
+    import wave
+
+    with wave.open(str(src), "rb") as w:
+        params = w.getparams()
+        frames = w.readframes(w.getnframes())
+    pad_frames = int(params.framerate * lead_ms / 1000)
+    pad = b"\x00" * (pad_frames * params.sampwidth * params.nchannels)
+    out = SOUNDS_DIR / "_cache" / f"{src.stem}_{lead_ms}ms.wav"
+    out.parent.mkdir(exist_ok=True)
+    with wave.open(str(out), "wb") as w:
+        w.setparams(params)
+        w.writeframes(pad + frames)
+    _prepared_beeps[key] = str(out)
+    return str(out)
+
+
 def beep(kind: str):
-    """Feedback tone.
+    """Feedback sound: sounds/<kind>.wav, else a synth tone.
 
-    UNSOLVED: the first beep after an idle pause is not heard; a second one
-    fired straight after always is. Ruled out so far - it is not the API
-    (winsound.Beep and a sounddevice tone fail identically), not the tone
-    length (120ms and 250ms both fail), not a start-vs-stop race, not the
-    Windows power plan, not USB selective suspend, and not per-device
-    power-save (all disabled, 22 devices, no change). A 37Hz wake pulse 60ms
-    ahead of the tone did not help either.
-
-    A permanently-open sounddevice keep-alive stream was tried to stop the
-    endpoint idling: it did not fix the beep and coincided with dictation
-    being clipped, so it was reverted rather than left in on a hunch.
-
-    Next thing to establish is which physical output actually reaches the
-    user's ears - that was never determined, and everything above assumed it.
+    Files play through winsound.PlaySound because it follows the LIVE
+    Windows default output. PortAudio snapshots the default endpoint once
+    at init, so after the wireless headset powers on/off and Windows flips
+    the default device, a sounddevice beep aimed at "default" hits a stale
+    endpoint and dies silently - which is why beeps kept breaking whenever
+    the headset came and went. PlaySound has no such cache.
     """
     if not CFG["beep_feedback"]:
         return
-    freq = {"start": 880, "stop": 660, "error": 220}.get(kind, 440)
-    ms = max(1, int(CFG.get("beep_ms", 250)))
-    threading.Thread(
-        target=lambda: winsound.Beep(freq, ms), daemon=True
-    ).start()
+
+    def _run():
+        try:
+            path = _prepared_beep(kind)
+            if path:
+                winsound.PlaySound(
+                    path,
+                    winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT,
+                )
+                return
+        except Exception as e:
+            log(f"beep sound failed ({e}); falling back to tone")
+        freq = {"start": 880, "stop": 660, "error": 220,
+                "ask": 990, "micdead": 150, "submit": 740}.get(kind, 440)
+        ms = max(1, int(CFG.get("beep_ms", 250)))
+        # PortAudio needs COM initialized on whichever thread opens the
+        # stream: from a bare background thread the open dies with host
+        # error -9999 (WDM-KS usbTerminalGUID) while the identical call
+        # succeeds on the main thread.
+        ctypes.windll.ole32.CoInitializeEx(None, 0)
+        try:
+            _render_beep(freq, ms)
+        except Exception as e:
+            log(f"beep fallback (sounddevice failed: {e})")
+            winsound.Beep(freq, ms)
+        finally:
+            ctypes.windll.ole32.CoUninitialize()
+
+    threading.Thread(target=_run, daemon=True).start()
 
 
 # ---------------------------------------------------------------- pipeline
@@ -1034,7 +1266,7 @@ def _monitor_voice_submit(stop_event: threading.Event):
             partial = transcribe(recorder.snapshot(window_sec))
             if has_submit_trigger(partial):
                 log(f"voice submit trigger heard: {partial!r}")
-                stop_and_process()
+                stop_and_process(sound="submit")
                 return
         except Exception as e:
             log(f"voice submit monitor skipped: {e}")
@@ -1057,8 +1289,9 @@ def start_recording(mode=None):
         # the stop beep (which races nothing, the pipeline sleeps 0.35s first)
         # always played and the start beep did not. Beeping here also means the
         # tone only fires once recording genuinely began; a mic failure now
-        # gets the error beep instead of a misleading start beep.
-        beep("start")
+        # gets the error beep instead of a misleading start beep. Ask mode
+        # gets its own sound so the triggered mode is audible.
+        beep("ask" if _rec_mode == "ask" else "start")
         log("recording started")
         if (_rec_mode == "dictate" and CFG.get("voice_submit_trigger_enabled", True)):
             _voice_submit_stop = threading.Event()
@@ -1071,7 +1304,11 @@ def start_recording(mode=None):
         set_state(State.IDLE)
 
 
-def stop_and_process():
+def stop_and_process(sound: str = "stop"):
+    """sound: which feedback plays for this stop - the voice submit monitor
+    passes "submit" so its confirmation REPLACES the stop sound (PlaySound
+    is one-at-a-time per process; back-to-back sounds would cut each other
+    off rather than queue)."""
     global _voice_submit_stop
     if get_state() != State.RECORDING:
         return
@@ -1079,7 +1316,7 @@ def stop_and_process():
         _voice_submit_stop.set()
         _voice_submit_stop = None
     set_state(State.PROCESSING)
-    beep("stop")
+    beep(sound)
 
     def _work():
         try:
@@ -1107,6 +1344,9 @@ def stop_and_process():
                 log(f"pipeline: mic near-silent (rms={rms:.6f}, {duration:.1f}s)"
                     f" - if you spoke and nothing appears, the mic has gated "
                     f"off; power-cycle the headset")
+                # audible version of the line above - without it a gated mic
+                # just looks like FlowLocal silently ate the dictation
+                beep("micdead")
             t0 = time.time()
             raw_text = transcribe(audio)
             log(f"pipeline: whisper done in {time.time()-t0:.1f}s -> {raw_text!r}")
@@ -1375,6 +1615,7 @@ def setup_hotkeys():
     threading.Thread(target=_hook_watchdog, daemon=True).start()
     log("hook watchdog armed")
     start_model_pin()
+    start_output_keepalive()
     wake_listener.start()
 
 

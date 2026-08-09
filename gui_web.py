@@ -202,7 +202,8 @@ class Api:
         except FileNotFoundError:
             vocab = ""
         return {"config": app.CFG, "models": MODELS, "vocab": vocab,
-                "ollama_models": app.CFG.get("ollama_model_choices", OLLAMA_CHOICES)}
+                "ollama_models": app.CFG.get("ollama_model_choices", OLLAMA_CHOICES),
+                "beep_sounds": app.list_beep_sounds()}
 
     def toggle(self):
         app._on_toggle()
@@ -250,6 +251,15 @@ class Api:
         if key in ("cleanup_enabled", "vault_append_enabled", "save_training_data"):
             app.CFG[key] = bool(value)
             app.CONFIG_PATH.write_text(json.dumps(app.CFG, indent=2), encoding="utf-8")
+
+    def set_beep_sound(self, kind, name):
+        """Dropdown change: persist immediately and preview the pick."""
+        if (kind not in ("start", "stop", "error", "ask", "micdead", "submit")
+                or name not in app.list_beep_sounds()):
+            return
+        app.CFG[f"beep_sound_{kind}"] = name
+        app.CONFIG_PATH.write_text(json.dumps(app.CFG, indent=2), encoding="utf-8")
+        app.beep(kind)  # hear it right away, exactly as it will sound in use
 
     def save_config(self, cfg):
         restart = (cfg["whisper_model"] != app.CFG["whisper_model"]
@@ -332,7 +342,7 @@ def main():
 
     win_main = webview.create_window(
         "FlowLocal", str(web / "hud.html"),
-        width=566, height=840, frameless=True, easy_drag=False,
+        width=566, height=1094, frameless=True, easy_drag=False,
         resizable=False, background_color=HUD_BG, js_api=api,
     )
 
