@@ -1496,6 +1496,26 @@ def _note_hook_event(_e=None):
     _last_hook_event = time.time()
 
 
+def _key_name(name):
+    """Canonical form for comparing a configured key to a live event name.
+
+    The raw hooks below compare event names directly, and that comparison is
+    case- and alias-sensitive in a way add_hotkey never was. A real F24 press
+    arrives as name 'f24' (scan 118), so a config of "F24" - the natural way to
+    write it, and what a G-key mapped to F24 needs - never matched and the
+    toggle silently did nothing. Normalizing both sides restores the
+    case-insensitivity add_hotkey gave us for free, and also folds aliases like
+    "Right Ctrl" -> "right ctrl" and "ESC" -> "esc".
+    """
+    try:
+        return keyboard.normalize_name(str(name).strip())
+    except Exception:
+        # normalize_name rejects None and unknown names; fall back to a plain
+        # casefold so an exotic key still compares sanely instead of raising
+        # inside the hook callback (which would kill the hook).
+        return str(name or "").strip().lower()
+
+
 def _install_key_hooks():
     """(Re)install every keyboard hook. Safe to call repeatedly - the watchdog
     calls it to recover a hook Windows threw away."""
@@ -1506,8 +1526,10 @@ def _install_key_hooks():
         # Raw hook with exact name match. on_press_key("right ctrl") resolves
         # to scan code 29, shared by BOTH ctrl keys - it would fire on left ctrl
         # too (breaking ctrl+c etc). Event names distinguish left/right.
+        hold_n = _key_name(hold)
+
         def _hold_hook(e):
-            if e.name != hold:
+            if _key_name(e.name) != hold_n:
                 return
             if e.event_type == "down":
                 _on_hold_press(e)
@@ -1526,8 +1548,10 @@ def _install_key_hooks():
     if tog:
         tog_down = [False]  # list, not a bool: closure needs to mutate it
 
+        tog_n = _key_name(tog)
+
         def _toggle_hook(e):
-            if e.name != tog:
+            if _key_name(e.name) != tog_n:
                 return
             if e.event_type == "down":
                 if tog_down[0]:  # key auto-repeat while held
@@ -1542,11 +1566,11 @@ def _install_key_hooks():
     if ask:
         # "ctrl+alt+space" -> modifiers checked live, main key drives the edge.
         _parts = [p.strip() for p in ask.split("+") if p.strip()]
-        ask_main, ask_mods = _parts[-1], _parts[:-1]
+        ask_main, ask_mods = _key_name(_parts[-1]), _parts[:-1]
         ask_down = [False]
 
         def _ask_hook(e):
-            if e.name != ask_main:
+            if _key_name(e.name) != ask_main:
                 return
             if e.event_type == "down":
                 if ask_down[0]:
