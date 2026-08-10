@@ -1,10 +1,80 @@
 # FlowLocal custom vocabulary - one term per line, # for comments.
 # These are fed to Whisper as hotwords so it spells them correctly.
+#
+# BUDGET: faster-whisper truncates hotwords at max_length // 2 - 1 = 223 tokens
+# (transcribe.py get_prompt). Past that, trailing terms are silently dropped, so
+# keep this list tight and put the terms you say most often nearest the top.
+# Check the cost after editing:  python tools/vocab_budget.py
+#
+# Only add terms Whisper actually gets wrong - ordinary English words waste
+# budget and dilute the bias on the terms that need it.
+
+# --- brands / business ---
 Fastec
+Calibration Wands
+Xenetech
+WooCommerce
+QuickBooks
+ERPNext
+Frappe
+PartKeepr
+Sam Hiatt
+
+# --- this project ---
 FlowLocal
 Wispr Flow
+Whisper
+faster-whisper
+distil-large-v3
+Kokoro
+hotwords
+
+# --- models / local inference ---
 Ollama
-OpenClaw
+llama.cpp
+Llama
 Hermes
+OpenClaw
+Gemma
+Qwen
+Anthropic
+MCP
+RAG
+
+# --- machines / hardware ---
 Alienware
 AWCC
+engraver-rig
+TC-ROGLaptop
+RTX
+VRAM
+CUDA
+cuDNN
+cuBLAS
+GHUB
+Logitech
+G502
+G915
+
+# --- OS / shell / tooling ---
+WSL
+PowerShell
+tmux
+Starship
+Zed
+Obsidian
+Tailscale
+Cloudflare
+
+# --- dev stack ---
+# Deliberately short: React, Python, JSON, Docker, API and friends are ordinary
+# words Whisper already gets right, and every one of them eats budget that the
+# error-prone proper nouns above need.
+Next.js
+Tailwind
+Vite
+PostgreSQL
+Prisma
+pytest
+ruff
+venv
